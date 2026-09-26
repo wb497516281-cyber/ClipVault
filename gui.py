@@ -1,0 +1,779 @@
+"""gui.py — ClipVault 原生桌面界面（tkinter + Canvas 画布）。
+
+无 Web、无浏览器：列表卡片直接画在 tkinter Canvas 上。
+功能：
+  1. 顶部搜索框（300ms 防抖）+ 类型筛选（全部/文本/图片）；
+  2. 配置 AI 后出现检索模式切换（智能/关键词/语义）；
+  3. 卡片：文本显示前若干字符，图片显示缩略图；元信息含时间/来源/类型/AI 分类；
+  4. 点击卡片 → 写回系统剪贴板（文本 CF_UNICODETEXT；图片多格式，QQ/微信可粘贴）；
+  5. 悬停卡片出现「置顶 / 删除」按钮；删除两步确认；
+  6. 置顶条目排最前且不同底色 + 左侧强调条；
+  7. 每 5 秒自动刷新（数据没变不重绘，不闪）；剪贴板采集在后台线程运行。
+
+运行：python gui.py            （默认同时启动采集器）
+      python gui.py --no-watch （只看界面，不采集）
+
+依赖：tkinter（Python 内置）、Pillow；采集需要 pywin32。
+"""
+
+from __future__ import annotations
+
+import sys
+import threading
+from datetime import datetime
+
+try:
+    import tkinter as tk
+except ImportError:  # 非 Windows / 精简 Python 环境
+    tk = None  # type: ignore[assignment]
+
+import ai_client
+import clipwriter
+import storage
+from config import BASE_DIR
+
+# ---------------------------------------------------------------------------
+# 常量
+# ---------------------------------------------------------------------------
+
+#: 每 5 秒自动刷新一次（采集器在后台持续记录）
+AUTO_REFRESH_MS = 5000
+
+#: 搜索防抖
+SEARCH_DEBOUNCE_MS = 300
+
+#: 删除二次确认的有效期
+DELETE_CONFIRM_MS = 3000
+
+#: 单次拉取条数上限
+LIST_LIMIT = 200
+
+#: 主题色（深色）
+C_BG = "#15181d"  # 窗口底
+C_CARD = "#1e222a"  # 卡片
+C_CARD_HOVER = "#242935"  # 卡片悬停
+C_CARD_PINNED = "#3a3320"  # 置顶卡片
+C_PINNED_BAR = "#d9a92c"  # 置顶左侧强调条
+C_BORDER = "#2e3540"
+C_TEXT = "#e8ecf1"
+C_DIM = "#8b96a5"
+C_ACCENT = "#5b9bff"
+C_DANGER = "#ef6b67"
+
+#: 卡片几何
+CARD_PAD = 10  # 卡片间距
+CARD_MARGIN = 12  # 画布边距
+THUMB_SIZE = 150  # 缩略图边长
+TEXT_PREVIEW_CHARS = 300  # 文本预览字符数
+META_HEIGHT = 24  # 元信息行高
+BTN_HEIGHT = 26  # 悬停按钮高
+
+
+def _fmt_time(created_at: str) -> str:
+    """数据库时间字符串 -> 相对时间（title 里保留绝对时间由画布 tooltip 处理）。"""
+    if not created_at:
+        return "-"
+    try:
+        then = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return created_at
+    diff = max(0, int((datetime.now() - then).total_seconds()))
+    if diff < 60:
+        return "刚刚"
+    if diff < 3600:
+        return f"{diff // 60} 分钟前"
+    if diff < 86400:
+        return f"{diff // 3600} 小时前"
+    if diff < 86400 * 30:
+        return f"{diff // 86400} 天前"
+    return f"{diff // 86400 // 30} 个月前"
+
+
+class ClipVaultGUI:
+    """ClipVault 主窗口：顶栏控件 + Canvas 画布列表 + 底部提示。"""
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        root.title("ClipVault · 剪贴板历史")
+        root.geometry("860x640")
+        root.minsize(560, 420)
+        root.configure(bg=C_BG)
+
+        # 运行状态
+        self.items: list[dict] = []  # 当前展示的条目
+        self.type_filter = "all"  # all / text / image
+        self.mode = "auto"  # auto / keyword / semantic
+        self.ai_configured = ai_client.is_configured()
+        self.hovered_id: int | None = None  # 悬停中的卡片
+        self.pending_delete_id: int | None = None
+        self._pending_delete_timer: str | None = None
+        self._search_timer: str | None = None
+        self._img_refs: list = []  # PhotoImage 引用，防 GC
+        self._fingerprint: str | None = None  # 上次渲染的数据指纹
+        self._card_rects: dict[int, tuple[int, int, int, int]] = {}  # id -> (x,y,w,h)
+        self._refresh_stopped = False  # 停止自动刷新链路用
+        # 句柄挂到 root 上：测试复用同一根窗口 / 托盘拆卸时可停掉刷新链
+        root._clipvault_gui = self  # noqa: SLF001
+
+        self._build_widgets()
+        self._load_and_render()
+        self._schedule_refresh()
+
+    # ------------------------------------------------------------------
+    # 界面构建
+    # ------------------------------------------------------------------
+
+    def _build_widgets(self) -> None:
+        """顶栏 + 画布 + 滚动条 + 提示条。"""
+        top = tk.Frame(self.root, bg=C_BG)
+        top.pack(fill=tk.X, padx=10, pady=(10, 6))
+
+        # —— 搜索框 ——
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", self._on_search_changed)
+        search_entry = tk.Entry(
+            top,
+            textvariable=self.search_var,
+            bg=C_CARD,
+            fg=C_TEXT,
+            insertbackground=C_TEXT,
+            highlightbackground=C_BORDER,
+            highlightcolor=C_ACCENT,
+            highlightthickness=1,
+            relief=tk.FLAT,
+            font=("Microsoft YaHei UI", 11),
+        )
+        search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+        search_entry.insert(0, "")
+        self._set_placeholder(search_entry, "搜索剪贴板内容或来源应用…")
+
+        # —— 类型筛选 ——
+        self.type_buttons: dict[str, tk.Button] = {}
+        for label, key in (("全部", "all"), ("文本", "text"), ("图片", "image")):
+            btn = tk.Button(
+                top,
+                text=label,
+                command=lambda k=key: self._on_type_filter(k),
+                bg=C_ACCENT if key == "all" else C_CARD,
+                fg="#ffffff" if key == "all" else C_DIM,
+                activebackground=C_CARD_HOVER,
+                activeforeground=C_TEXT,
+                relief=tk.FLAT,
+                font=("Microsoft YaHei UI", 10),
+                padx=10,
+                pady=2,
+                cursor="hand2",
+            )
+            btn.pack(side=tk.LEFT, padx=(8, 0))
+            self.type_buttons[key] = btn
+
+        # —— 检索模式（仅配置 AI 时显示） ——
+        self.mode_buttons: dict[str, tk.Button] = {}
+        if self.ai_configured:
+            for label, key in (("智能", "auto"), ("关键词", "keyword"), ("语义", "semantic")):
+                btn = tk.Button(
+                    top,
+                    text=label,
+                    command=lambda k=key: self._on_mode(k),
+                    bg=C_ACCENT if key == "auto" else C_CARD,
+                    fg="#ffffff" if key == "auto" else C_DIM,
+                    activebackground=C_CARD_HOVER,
+                    activeforeground=C_TEXT,
+                    relief=tk.FLAT,
+                    font=("Microsoft YaHei UI", 10),
+                    padx=10,
+                    pady=2,
+                    cursor="hand2",
+                )
+                btn.pack(side=tk.LEFT, padx=(8, 0))
+                self.mode_buttons[key] = btn
+
+        # —— 计数标签 ——
+        self.count_var = tk.StringVar(value="")
+        count_label = tk.Label(
+            top,
+            textvariable=self.count_var,
+            bg=C_BG,
+            fg=C_DIM,
+            font=("Microsoft YaHei UI", 10),
+        )
+        count_label.pack(side=tk.RIGHT, padx=(8, 2))
+
+        # —— 画布 + 滚动条 ——
+        canvas_frame = tk.Frame(self.root, bg=C_BG)
+        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
+
+        self.canvas = tk.Canvas(
+            canvas_frame,
+            bg=C_BG,
+            highlightthickness=0,
+            bd=0,
+        )
+        scrollbar = tk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # 画布事件：点击 / 悬停 / 滚轮 / 尺寸变化
+        self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
+
+        # —— 底部提示（toast） ——
+        self.toast_var = tk.StringVar(value="")
+        self.toast_label = tk.Label(
+            self.root,
+            textvariable=self.toast_var,
+            bg="#222831",  # 注意：tkinter 只接受 6 位 hex，不能带透明度后缀
+            fg="#ffffff",
+            font=("Microsoft YaHei UI", 10),
+            padx=14,
+            pady=6,
+        )
+        self.toast_label.place(relx=0.5, rely=0.94, anchor=tk.CENTER)
+        self.toast_label.place_forget()
+
+        # 窗口图标（assets/tray.png 存在时）
+        icon_path = BASE_DIR / "assets" / "tray.png"
+        if icon_path.is_file():
+            try:
+                from PIL import ImageTk
+
+                self._img_refs.append(ImageTk.PhotoImage(file=icon_path))
+                self.root.iconphoto(True, self._img_refs[-1])
+            except Exception:
+                pass
+
+    def _set_placeholder(self, entry: tk.Entry, text: str) -> None:
+        """灰字占位符（聚焦清空、失焦恢复）。"""
+        self._placeholder = text
+        self._placeholder_active = True
+
+        def on_focus_in(_event):
+            if self._placeholder_active:
+                entry.delete(0, tk.END)
+                entry.configure(fg=C_TEXT)
+                self._placeholder_active = False
+
+        def on_focus_out(_event):
+            if not entry.get():
+                entry.insert(0, text)
+                entry.configure(fg=C_DIM)
+                self._placeholder_active = True
+
+        entry.insert(0, text)
+        entry.configure(fg=C_DIM)
+        entry.bind("<FocusIn>", on_focus_in)
+        entry.bind("<FocusOut>", on_focus_out)
+
+    # ------------------------------------------------------------------
+    # 数据加载（关键词 + 语义混合）
+    # ------------------------------------------------------------------
+
+    def _current_query(self) -> str:
+        """取当前搜索词（占位符状态视为空）。"""
+        if self._placeholder_active:
+            return ""
+        return self.search_var.get().strip()
+
+    def _load_items(self) -> list[dict]:
+        """按当前搜索词/筛选/模式加载条目。"""
+        q = self._current_query()
+        use_semantic = self.mode == "semantic" or (self.mode == "auto" and self.ai_configured)
+        if q and use_semantic:
+            rows = self._semantic_rows(q) or storage.list_items(
+                q=q, limit=LIST_LIMIT, content_type=self.type_filter
+            )
+        elif q:
+            rows = storage.list_items(q=q, limit=LIST_LIMIT, content_type=self.type_filter)
+        else:
+            rows = storage.list_items(limit=LIST_LIMIT, content_type=self.type_filter)
+        return rows
+
+    def _semantic_rows(self, q: str) -> list[dict]:
+        """语义检索：查询词向量化后按余弦相似度排序；失败返回空列表（降级关键词）。"""
+        if not self.ai_configured:
+            return []
+        query_vector = ai_client.embed_text(q)
+        if not query_vector:
+            return []
+        scored: list[tuple[float, int]] = []
+        for item_id, vector in storage.load_vectors():
+            score = ai_client.cosine_similarity(query_vector, vector)
+            if score > 0.0:
+                scored.append((score, item_id))
+        scored.sort(key=lambda pair: (-pair[0], -pair[1]))
+        row_map = storage.find_by_ids([item_id for _, item_id in scored[:LIST_LIMIT]])
+        rows = [row_map[item_id] for _, item_id in scored[:LIST_LIMIT] if item_id in row_map]
+        # 语义结果同样遵守置顶优先（稳定排序：组内保持余弦相似度顺序）
+        rows.sort(key=lambda r: 0 if r["is_pinned"] else 1)
+        # 类型筛选
+        if self.type_filter != "all":
+            rows = [r for r in rows if r["content_type"] == self.type_filter]
+        return rows
+
+    # ------------------------------------------------------------------
+    # 渲染（全部画在 Canvas 上）
+    # ------------------------------------------------------------------
+
+    def _load_and_render(self) -> None:
+        """加载数据并渲染；数据没变（指纹一致）就跳过重绘。"""
+        self.items = self._load_items()
+        fingerprint = "|".join(
+            f"{r['id']}:{r['is_pinned']}:{r['category'] or ''}:{r['content_type']}"
+            for r in self.items
+        )
+        if fingerprint == self._fingerprint:
+            return
+        self._fingerprint = fingerprint
+        self._render()
+
+    def _render(self) -> None:
+        """清空画布并按数据重绘所有卡片。"""
+        self.canvas.delete("all")
+        self._card_rects.clear()
+        self._img_refs.clear()
+
+        canvas_width = max(self.canvas.winfo_width(), 400)
+        card_width = canvas_width - 2 * CARD_MARGIN
+        y = CARD_MARGIN
+
+        if not self.items:
+            self.canvas.create_text(
+                canvas_width // 2,
+                80,
+                text="暂无剪贴板记录，去复制点内容试试～",
+                fill=C_DIM,
+                font=("Microsoft YaHei UI", 12),
+            )
+            self.canvas.configure(scrollregion=(0, 0, canvas_width, 200))
+            self.count_var.set("0 条")
+            return
+
+        for item in self.items:
+            height = self._card_height(item, card_width)
+            self._draw_card(item, CARD_MARGIN, y, card_width, height)
+            self._card_rects[item["id"]] = (CARD_MARGIN, y, card_width, height)
+            y += height + CARD_PAD
+
+        total = y - CARD_PAD + CARD_MARGIN
+        self.canvas.configure(scrollregion=(0, 0, canvas_width, total))
+        self.count_var.set(f"{len(self.items)} 条")
+
+    def _card_height(self, item: dict, width: int) -> int:
+        """估算卡片高度：图片卡固定，文本卡按行数估算。"""
+        if item["content_type"] == "image":
+            return THUMB_SIZE + META_HEIGHT + 16
+        text = item.get("text_content") or ""
+        chars_per_line = max(20, width // 13)  # 中文约 13px/字
+        lines = min(6, max(1, (len(text) + chars_per_line - 1) // chars_per_line))
+        return lines * 22 + META_HEIGHT + 16
+
+    def _draw_card(self, item: dict, x: int, y: int, w: int, h: int) -> None:
+        """画单张卡片（背景/内容/元信息/悬停按钮）。"""
+        pinned = bool(item["is_pinned"])
+        hovered = self.hovered_id == item["id"]
+
+        if pinned:
+            bg = C_CARD_PINNED
+        elif hovered:
+            bg = C_CARD_HOVER
+        else:
+            bg = C_CARD
+
+        # 卡片背景 + 边框
+        self.canvas.create_rectangle(
+            x,
+            y,
+            x + w,
+            y + h,
+            fill=bg,
+            outline=C_BORDER,
+            width=1,
+            tags=("card", f"card-{item['id']}"),
+        )
+        # 置顶左侧强调条
+        if pinned:
+            self.canvas.create_rectangle(
+                x,
+                y,
+                x + 4,
+                y + h,
+                fill=C_PINNED_BAR,
+                outline=C_PINNED_BAR,
+                tags=("card", f"card-{item['id']}"),
+            )
+
+        meta_y = y + h - META_HEIGHT - 4
+
+        # —— 内容区 ——
+        if item["content_type"] == "image":
+            self._draw_thumb(item, x + 10, y + 8, THUMB_SIZE)
+        else:
+            text = item.get("text_content") or ""
+            preview = text[:TEXT_PREVIEW_CHARS] + ("…" if len(text) > TEXT_PREVIEW_CHARS else "")
+            self.canvas.create_text(
+                x + 12,
+                y + 8,
+                text=preview,
+                fill=C_TEXT,
+                font=("Microsoft YaHei UI", 11),
+                width=w - 24,
+                anchor=tk.NW,
+                tags=("card", f"card-{item['id']}"),
+            )
+
+        # —— 元信息行：类型 + 时间 + 分类 + 来源 ——
+        type_label = "图片" if item["content_type"] == "image" else "文本"
+        meta_text = f"{type_label} · {_fmt_time(item['created_at'])}"
+        if item.get("category"):
+            meta_text += f" · [{item['category']}]"
+        meta_text += f" · {item.get('source_app') or '未知来源'}"
+        self.canvas.create_text(
+            x + 12,
+            meta_y,
+            text=meta_text,
+            fill=C_DIM,
+            font=("Microsoft YaHei UI", 9),
+            anchor=tk.NW,
+            tags=("card", f"card-{item['id']}"),
+        )
+
+        # —— 悬停时才画操作按钮 ——
+        if hovered:
+            self._draw_action_buttons(item, x, y, w)
+
+    def _draw_thumb(self, item: dict, x: int, y: int, size: int) -> None:
+        """画图片缩略图（文件缺失时画占位框）。"""
+        rel = item.get("thumbnail_path") or item.get("image_path")
+        if not rel:
+            self.canvas.create_rectangle(
+                x,
+                y,
+                x + size,
+                y + size,
+                fill=C_CARD_HOVER,
+                outline=C_BORDER,
+                tags=("card", f"card-{item['id']}"),
+            )
+            self.canvas.create_text(
+                x + size // 2,
+                y + size // 2,
+                text="图片缺失",
+                fill=C_DIM,
+                font=("Microsoft YaHei UI", 10),
+                tags=("card", f"card-{item['id']}"),
+            )
+            return
+        path = (storage.DATA_DIR / rel).resolve()
+        if not path.is_file():
+            self.canvas.create_rectangle(
+                x,
+                y,
+                x + size,
+                y + size,
+                fill=C_CARD_HOVER,
+                outline=C_BORDER,
+                tags=("card", f"card-{item['id']}"),
+            )
+            self.canvas.create_text(
+                x + size // 2,
+                y + size // 2,
+                text="图片缺失",
+                fill=C_DIM,
+                font=("Microsoft YaHei UI", 10),
+                tags=("card", f"card-{item['id']}"),
+            )
+            return
+        try:
+            from PIL import Image, ImageTk
+
+            with Image.open(path) as im:
+                im = im.convert("RGB")
+                im.thumbnail((size, size))
+                photo = ImageTk.PhotoImage(im)
+            self._img_refs.append(photo)  # 必须保引用，否则被 GC 后画布空白
+            self.canvas.create_image(
+                x, y, image=photo, anchor=tk.NW, tags=("card", f"card-{item['id']}")
+            )
+        except Exception:
+            self.canvas.create_rectangle(
+                x,
+                y,
+                x + size,
+                y + size,
+                fill=C_CARD_HOVER,
+                outline=C_BORDER,
+                tags=("card", f"card-{item['id']}"),
+            )
+
+    def _draw_action_buttons(self, item: dict, card_x: int, card_y: int, card_w: int) -> None:
+        """在悬停卡片右上角画「置顶 / 删除」按钮。"""
+        btn_w, btn_h = 62, BTN_HEIGHT
+        gap = 6
+        x1 = card_x + card_w - btn_w * 2 - gap - 8
+        x2 = card_x + card_w - btn_w - 8
+        y = card_y + 8
+
+        pinned = bool(item["is_pinned"])
+        pin_text = "取消置顶" if pinned else "置顶"
+        del_pending = self.pending_delete_id == item["id"]
+        del_text = "确认删除" if del_pending else "删除"
+
+        # 置顶按钮
+        self.canvas.create_rectangle(
+            x1,
+            y,
+            x1 + btn_w,
+            y + btn_h,
+            fill=C_ACCENT,
+            outline=C_ACCENT,
+            tags=("action", f"pin-{item['id']}"),
+        )
+        self.canvas.create_text(
+            x1 + btn_w // 2,
+            y + btn_h // 2,
+            text=pin_text,
+            fill="#ffffff",
+            font=("Microsoft YaHei UI", 9),
+            tags=("action", f"pin-{item['id']}"),
+        )
+        # 删除按钮（确认态变红）
+        del_bg = C_DANGER if del_pending else C_CARD
+        del_fg = "#ffffff" if del_pending else C_TEXT
+        self.canvas.create_rectangle(
+            x2,
+            y,
+            x2 + btn_w,
+            y + btn_h,
+            fill=del_bg,
+            outline=C_DANGER,
+            tags=("action", f"del-{item['id']}"),
+        )
+        self.canvas.create_text(
+            x2 + btn_w // 2,
+            y + btn_h // 2,
+            text=del_text,
+            fill=del_fg,
+            font=("Microsoft YaHei UI", 9),
+            tags=("action", f"del-{item['id']}"),
+        )
+
+    # ------------------------------------------------------------------
+    # 画布事件
+    # ------------------------------------------------------------------
+
+    def _hit_test(self, event) -> tuple[str | None, int | None]:
+        """把画布坐标上的点击解析成 ('action:pin'|'action:del'|'card', item_id)。"""
+        x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        # 先查悬停按钮（小区域优先）
+        for item_id, (cx, cy, cw, ch) in self._card_rects.items():
+            if not (cx <= x <= cx + cw and cy <= y <= cy + ch):
+                continue
+            btn_w, btn_h, gap = 62, BTN_HEIGHT, 6
+            bx1 = cx + cw - btn_w * 2 - gap - 8
+            bx2 = cx + cw - btn_w - 8
+            by = cy + 8
+            if self.hovered_id == item_id:
+                if bx1 <= x <= bx1 + btn_w and by <= y <= by + btn_h:
+                    return ("action:pin", item_id)
+                if bx2 <= x <= bx2 + btn_w and by <= y <= by + btn_h:
+                    return ("action:del", item_id)
+            return ("card", item_id)
+        return (None, None)
+
+    def _on_click(self, event) -> None:
+        kind, item_id = self._hit_test(event)
+        if kind == "action:pin" and item_id is not None:
+            self._toggle_pin(item_id)
+        elif kind == "action:del" and item_id is not None:
+            self._handle_delete_click(item_id)
+        elif kind == "card" and item_id is not None:
+            self._copy_item(item_id)
+
+    def _on_motion(self, event) -> None:
+        """悬停高亮：只在其变化时重绘，避免拖动鼠标疯狂重画。"""
+        kind, item_id = self._hit_test(event)
+        new_hover = item_id if kind in ("card", "action:pin", "action:del") else None
+        if new_hover != self.hovered_id:
+            self.hovered_id = new_hover
+            self._render()
+
+    def _on_mousewheel(self, event) -> None:
+        self.canvas.yview_scroll(-1 * (event.delta // 120), "units")
+
+    def _on_canvas_resize(self, event) -> None:
+        """窗口宽度变化后重新布局（防抖：宽度确实变了才重绘）。"""
+        new_width = event.width
+        if getattr(self, "_last_canvas_width", None) != new_width:
+            self._last_canvas_width = new_width
+            self._render()
+
+    # ------------------------------------------------------------------
+    # 动作
+    # ------------------------------------------------------------------
+
+    def _copy_item(self, item_id: int) -> None:
+        """把条目写回系统剪贴板。"""
+        item = storage.get_item(item_id)
+        if item is None:
+            return
+        try:
+            if item["content_type"] == "text":
+                clipwriter.set_clipboard_text(item.get("text_content") or "")
+            else:
+                rel = item.get("image_path")
+                if not rel:
+                    raise FileNotFoundError("原图文件不存在（可能已被清理）")
+                clipwriter.set_clipboard_image((storage.DATA_DIR / rel).resolve())
+            self._toast("✅ 已复制到剪贴板（可直接粘贴到 QQ/微信）")
+        except clipwriter.ClipboardBusyError as exc:
+            self._toast(f"⚠️ {exc}", error=True)
+        except Exception as exc:
+            self._toast(f"❌ 复制失败：{exc}", error=True)
+
+    def _toggle_pin(self, item_id: int) -> None:
+        item = storage.get_item(item_id)
+        if item is None:
+            return
+        storage.update_pin(item_id, not bool(item["is_pinned"]))
+        self._fingerprint = None  # 强制重绘（排序会变）
+        self.hovered_id = None
+        self._load_and_render()
+        self._toast("📌 已置顶" if not item["is_pinned"] else "已取消置顶")
+
+    def _handle_delete_click(self, item_id: int) -> None:
+        """删除两步确认：第一次进入确认态，3 秒内再点才真删。"""
+        if self.pending_delete_id == item_id:
+            self._cancel_pending_delete()
+            self._delete_item(item_id)
+            return
+        self._cancel_pending_delete()
+        self.pending_delete_id = item_id
+        self._render()
+        self._pending_delete_timer = self.root.after(DELETE_CONFIRM_MS, self._cancel_pending_delete)
+
+    def _cancel_pending_delete(self) -> None:
+        if self._pending_delete_timer is not None:
+            self.root.after_cancel(self._pending_delete_timer)
+            self._pending_delete_timer = None
+        if self.pending_delete_id is not None:
+            self.pending_delete_id = None
+            self._render()
+
+    def _delete_item(self, item_id: int) -> None:
+        """删除条目：行 + 向量 + 图片文件。"""
+        paths = storage.delete_item(item_id)
+        for rel in paths:
+            path = (storage.DATA_DIR / rel).resolve()
+            # 只删数据目录内的文件，防路径穿越
+            if path.is_file() and storage.IMAGE_DIR in path.parents:
+                path.unlink()
+        self._fingerprint = None
+        self.hovered_id = None
+        self._load_and_render()
+        self._toast("🗑 已删除")
+
+    def _on_type_filter(self, key: str) -> None:
+        self.type_filter = key
+        for k, btn in self.type_buttons.items():
+            btn.configure(bg=C_ACCENT if k == key else C_CARD, fg="#ffffff" if k == key else C_DIM)
+        self._fingerprint = None
+        self._load_and_render()
+
+    def _on_mode(self, key: str) -> None:
+        self.mode = key
+        for k, btn in self.mode_buttons.items():
+            btn.configure(bg=C_ACCENT if k == key else C_CARD, fg="#ffffff" if k == key else C_DIM)
+        self._fingerprint = None
+        self._load_and_render()
+
+    def _on_search_changed(self, *_args) -> None:
+        """搜索防抖：停止输入 300ms 后才查询。"""
+        if self._search_timer is not None:
+            self.root.after_cancel(self._search_timer)
+        self._search_timer = self.root.after(SEARCH_DEBOUNCE_MS, self._apply_search)
+
+    def _apply_search(self) -> None:
+        self._fingerprint = None
+        self._load_and_render()
+
+    # ------------------------------------------------------------------
+    # 提示与自动刷新
+    # ------------------------------------------------------------------
+
+    def _toast(self, message: str, error: bool = False) -> None:
+        """底部浮动提示，2 秒后消失（tkinter 只接受 6 位 hex 色值）。"""
+        self.toast_var.set(message)
+        self.toast_label.configure(bg="#b23b3b" if error else "#2e7d4f")
+        self.toast_label.place(relx=0.5, rely=0.94, anchor=tk.CENTER)
+        if getattr(self, "_toast_timer", None) is not None:
+            self.root.after_cancel(self._toast_timer)
+        self._toast_timer = self.root.after(2000, self.toast_label.place_forget)
+
+    def stop_refresh(self) -> None:
+        """停止自动刷新链路与待触发的定时器（窗口复用/拆卸时调用）。"""
+        self._refresh_stopped = True
+        for attr in ("_pending_delete_timer", "_search_timer", "_toast_timer"):
+            timer = getattr(self, attr, None)
+            if timer is not None:
+                try:
+                    self.root.after_cancel(timer)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+    def _schedule_refresh(self) -> None:
+        """每 5 秒拉一次数据；指纹不变不重绘（不闪）。"""
+        if self._refresh_stopped:
+            return
+        self._load_and_render()
+        self.root.after(AUTO_REFRESH_MS, self._schedule_refresh)
+
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> None:
+    """启动 GUI；默认同时拉起采集器线程（--no-watch 可关闭）。"""
+    argv = argv if argv is not None else sys.argv[1:]
+    if tk is None:
+        print("当前环境没有 tkinter，无法启动图形界面。")
+        raise SystemExit(1)
+
+    storage.init_db()
+
+    stop_event = threading.Event()
+    pause_event = threading.Event()
+    if "--no-watch" not in argv:
+        try:
+            import watcher
+        except ImportError as exc:
+            print(f"剪贴板采集不可用（缺少依赖）：{exc}\n仅启动界面。", flush=True)
+        else:
+            threading.Thread(
+                target=watcher.run_collector,
+                args=(stop_event, pause_event),
+                name="clipvault-collector",
+                daemon=True,
+            ).start()
+            print("ClipVault 已启动：采集器运行中，界面已打开。", flush=True)
+    else:
+        print("ClipVault 已启动（--no-watch：仅界面，不采集）。", flush=True)
+
+    root = tk.Tk()
+    ClipVaultGUI(root)  # 实例由 root.after 回调与控件事件链路持有，无需外部引用
+
+    def on_close():
+        stop_event.set()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

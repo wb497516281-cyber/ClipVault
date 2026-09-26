@@ -1,0 +1,104 @@
+# pyproject.toml — ClipVault 项目配置。
+#
+# 用途：声明项目元数据、运行时依赖、命令行入口与代码检查（ruff）配置。
+# 安装：pip install -e .        （开发模式，改代码即时生效）
+# 运行：clipvault（GUI 主界面）/ clipvault-watch（纯采集）/ clipvault-tray（托盘常驻）
+# 说明：pywin32 仅 Windows 平台需要，已用 sys_platform 标记，Linux/macOS 安装时自动跳过。
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clipvault"
+version = "1.0.0"
+description = "本地可视化剪贴板管理器：后台自动记录文本与图片，原生桌面界面查看、搜索、一键复制"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"                # PEP 639 SPDX 表达式（setuptools>=77）
+keywords = ["clipboard", "clipboard-history", "tkinter", "windows", "sqlite"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Utilities",
+]
+
+# 运行时依赖（与 requirements.txt 保持一致的下限约束）
+dependencies = [
+    "Pillow>=10.2",
+    "pywin32>=306; sys_platform == 'win32'",
+]
+
+# 开发/贡献者依赖：pip install -e ".[dev]"
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+# 托盘常驻模式：pip install -e ".[tray]" 后 python tray.py
+tray = [
+    "pystray>=0.19",
+]
+# 打包 exe：pip install -e ".[build]" 后 pyinstaller packaging.spec
+build = [
+    "pyinstaller>=6.10",
+]
+
+# 命令行入口：pip install -e . 后可直接使用
+[project.scripts]
+clipvault = "gui:main"           # GUI 主界面（默认同时启动采集器）
+clipvault-watch = "watcher:main" # 只启动剪贴板采集循环（无界面）
+clipvault-tray = "tray:main"     # 托盘常驻（采集 + GUI 一体，需 .[tray]）
+
+[project.urls]
+Homepage = "https://github.com/wb497516281-cyber/ClipVault"
+Repository = "https://github.com/wb497516281-cyber/ClipVault"
+Issues = "https://github.com/wb497516281-cyber/ClipVault/issues"
+
+# 扁平布局：平级模块全部列出。
+# 注意：py-modules 必须列全 —— 显式声明会关闭 setuptools 的自动发现，
+# 漏列会导致 pip install .（非 editable）/ 构建 wheel 时缺模块、入口命令直接 ModuleNotFoundError。
+[tool.setuptools]
+py-modules = [
+    "gui",
+    "storage",
+    "watcher",
+    "clipwriter",
+    "ai_client",
+    "config",
+    "autostart",
+    "tray",
+    "make_icon",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# 默认规则集 + 少量实用项：未用导入、异常穿透、print 不报错（本工具就是 GUI 常驻）
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",   # 行宽交给 formatter，中文注释容易误伤
+]
+
+# 说明：ruff format 的行宽沿用上面 [tool.ruff] line-length = 100
+[tool.ruff.lint.isort]
+known-first-party = [
+    "gui",
+    "storage",
+    "watcher",
+    "clipwriter",
+    "ai_client",
+    "autostart",
+    "config",
+    "tray",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

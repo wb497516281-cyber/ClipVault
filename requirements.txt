@@ -1,0 +1,11 @@
+# requirements.txt — ClipVault 运行时依赖（Python 3.12+，Windows 为主）。
+#
+# 安装：pip install -r requirements.txt
+# 说明：
+#   - 界面是 Python 内置 tkinter，无需额外安装；
+#   - pywin32 仅在 Windows 上需要（剪贴板与窗口标题读取），Linux/macOS 自动跳过；
+#   - AI 能力用标准库 urllib 实现，无额外依赖。
+# 约束与 pyproject.toml 的 dependencies 保持一致，改一处记得同步另一处。
+
+Pillow>=10.2                        # 图片处理：ImageGrab 取图、缩略图、RGB/PNG 归一化
+pywin32>=306; sys_platform == "win32"   # Windows API：剪贴板(CF_DIB/CF_UNICODETEXT)、前台窗口标题

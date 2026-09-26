@@ -1,0 +1,36 @@
+# .gitignore — ClipVault
+# 原则：数据不入库、密钥不入库、缓存与虚拟环境不入库。
+
+# ---------- 运行时数据（用户隐私内容，绝不提交） ----------
+clipboard_data/
+*.db
+*.db-wal
+*.db-shm
+
+# ---------- 密钥与环境 ----------
+.env
+.env.*
+!.env.example
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- 编辑器与系统 ----------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
