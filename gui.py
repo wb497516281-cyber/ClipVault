@@ -24,11 +24,14 @@ from datetime import datetime
 
 try:
     import tkinter as tk
+    from tkinter import messagebox
 except ImportError:  # 非 Windows / 精简 Python 环境
     tk = None  # type: ignore[assignment]
+    messagebox = None  # type: ignore[assignment]
 
 import ai_client
 import clipwriter
+import config
 import storage
 from config import BASE_DIR
 
@@ -167,26 +170,29 @@ class ClipVaultGUI:
             btn.pack(side=tk.LEFT, padx=(8, 0))
             self.type_buttons[key] = btn
 
-        # —— 检索模式（仅配置 AI 时显示） ——
+        # —— 检索模式容器（仅配置 AI 时才有按钮；设置窗口可动态增删） ——
+        self.mode_frame = tk.Frame(top, bg=C_BG)
+        self.mode_frame.pack(side=tk.LEFT)
         self.mode_buttons: dict[str, tk.Button] = {}
-        if self.ai_configured:
-            for label, key in (("智能", "auto"), ("关键词", "keyword"), ("语义", "semantic")):
-                btn = tk.Button(
-                    top,
-                    text=label,
-                    command=lambda k=key: self._on_mode(k),
-                    bg=C_ACCENT if key == "auto" else C_CARD,
-                    fg="#ffffff" if key == "auto" else C_DIM,
-                    activebackground=C_CARD_HOVER,
-                    activeforeground=C_TEXT,
-                    relief=tk.FLAT,
-                    font=("Microsoft YaHei UI", 10),
-                    padx=10,
-                    pady=2,
-                    cursor="hand2",
-                )
-                btn.pack(side=tk.LEFT, padx=(8, 0))
-                self.mode_buttons[key] = btn
+        self._rebuild_mode_buttons()
+
+        # —— AI 设置按钮 ——
+        settings_btn = tk.Button(
+            top,
+            text="AI 设置",
+            command=self.open_settings,
+            bg=C_CARD,
+            fg=C_DIM if not self.ai_configured else C_ACCENT,
+            activebackground=C_CARD_HOVER,
+            activeforeground=C_TEXT,
+            relief=tk.FLAT,
+            font=("Microsoft YaHei UI", 10),
+            padx=10,
+            pady=2,
+            cursor="hand2",
+        )
+        settings_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.settings_btn = settings_btn
 
         # —— 计数标签 ——
         self.count_var = tk.StringVar(value="")
@@ -688,6 +694,253 @@ class ClipVaultGUI:
             btn.configure(bg=C_ACCENT if k == key else C_CARD, fg="#ffffff" if k == key else C_DIM)
         self._fingerprint = None
         self._load_and_render()
+
+    def _rebuild_mode_buttons(self) -> None:
+        """按当前 AI 配置状态重建「检索模式」按钮（设置窗口保存后调用）。"""
+        for btn in self.mode_buttons.values():
+            btn.destroy()
+        self.mode_buttons = {}
+        if not self.ai_configured:
+            return
+        for label, key in (("智能", "auto"), ("关键词", "keyword"), ("语义", "semantic")):
+            btn = tk.Button(
+                self.mode_frame,
+                text=label,
+                command=lambda k=key: self._on_mode(k),
+                bg=C_ACCENT if key == self.mode else C_CARD,
+                fg="#ffffff" if key == self.mode else C_DIM,
+                activebackground=C_CARD_HOVER,
+                activeforeground=C_TEXT,
+                relief=tk.FLAT,
+                font=("Microsoft YaHei UI", 10),
+                padx=10,
+                pady=2,
+                cursor="hand2",
+            )
+            btn.pack(side=tk.LEFT, padx=(8, 0))
+            self.mode_buttons[key] = btn
+
+    # ------------------------------------------------------------------
+    # AI 设置窗口（界面直接配置 API，保存到 settings.json 即时生效）
+    # ------------------------------------------------------------------
+
+    #: 设置项：（标签, 配置键, 控件类型）
+    _SETTINGS_FIELDS: tuple[tuple[str, str, str], ...] = (
+        ("API Key", "CLIPVAULT_AI_API_KEY", "secret"),
+        ("接口地址 Base URL", "CLIPVAULT_AI_BASE_URL", "text"),
+        ("分类模型", "CLIPVAULT_AI_CHAT_MODEL", "text"),
+        ("向量模型", "CLIPVAULT_AI_EMBED_MODEL", "text"),
+        ("候选分类（逗号分隔）", "CLIPVAULT_AI_CATEGORIES", "text"),
+        ("请求超时（秒）", "CLIPVAULT_AI_TIMEOUT", "text"),
+    )
+
+    #: 设置项的默认展示值（与 ai_client 的常量保持一致）
+    _SETTINGS_DEFAULTS = {
+        "CLIPVAULT_AI_API_KEY": "",
+        "CLIPVAULT_AI_BASE_URL": "https://api.openai.com/v1",
+        "CLIPVAULT_AI_CHAT_MODEL": "gpt-4o-mini",
+        "CLIPVAULT_AI_EMBED_MODEL": "text-embedding-3-small",
+        "CLIPVAULT_AI_CATEGORIES": "、".join(ai_client.DEFAULT_CATEGORIES),
+        "CLIPVAULT_AI_TIMEOUT": "10",
+    }
+
+    def open_settings(self) -> None:
+        """打开 AI 设置窗口（模态）；已打开则提到最前。"""
+        existing = getattr(self, "_settings_win", None)
+        if existing is not None:
+            existing.lift()
+            existing.focus_set()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("AI 设置")
+        win.configure(bg=C_BG)
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        entries: dict[str, tk.StringVar] = {}
+        show_key = tk.BooleanVar(value=False)
+
+        # —— 顶部说明 ——
+        tk.Label(
+            win,
+            text="AI 用于自动分类与语义搜索；不配置则自动使用关键词搜索。\n"
+            "配置保存在 clipboard_data/settings.json，仅存在本机。",
+            bg=C_BG,
+            fg=C_DIM,
+            font=("Microsoft YaHei UI", 9),
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, columnspan=3, padx=14, pady=(14, 8), sticky=tk.W)
+
+        # —— 启用开关 ——
+        enabled_var = tk.BooleanVar(
+            value=config.get_setting("CLIPVAULT_AI_ENABLED", "1").lower()
+            not in ("0", "false", "no")
+        )
+        tk.Checkbutton(
+            win,
+            text="启用 AI 功能",
+            variable=enabled_var,
+            bg=C_BG,
+            fg=C_TEXT,
+            selectcolor=C_CARD,
+            activebackground=C_BG,
+            activeforeground=C_TEXT,
+            font=("Microsoft YaHei UI", 10),
+        ).grid(row=1, column=0, columnspan=3, padx=14, pady=4, sticky=tk.W)
+
+        # —— 各字段 ——
+        row = 2
+        for label, key, kind in self._SETTINGS_FIELDS:
+            tk.Label(win, text=label, bg=C_BG, fg=C_DIM, font=("Microsoft YaHei UI", 10)).grid(
+                row=row, column=0, padx=(14, 6), pady=4, sticky=tk.W
+            )
+            var = tk.StringVar(value=config.get_setting(key, self._SETTINGS_DEFAULTS.get(key, "")))
+            entries[key] = var
+            entry = tk.Entry(
+                win,
+                textvariable=var,
+                width=42,
+                show="*" if kind == "secret" else "",
+                bg=C_CARD,
+                fg=C_TEXT,
+                insertbackground=C_TEXT,
+                highlightbackground=C_BORDER,
+                highlightcolor=C_ACCENT,
+                highlightthickness=1,
+                relief=tk.FLAT,
+                font=("Microsoft YaHei UI", 10),
+            )
+            entry.grid(row=row, column=1, padx=4, pady=4)
+            if kind == "secret":
+                # Key 显示 / 隐藏切换
+                tk.Checkbutton(
+                    win,
+                    text="显示",
+                    variable=show_key,
+                    command=lambda e=entry: e.configure(show="" if show_key.get() else "*"),
+                    bg=C_BG,
+                    fg=C_DIM,
+                    selectcolor=C_CARD,
+                    activebackground=C_BG,
+                    activeforeground=C_TEXT,
+                    font=("Microsoft YaHei UI", 9),
+                ).grid(row=row, column=2, padx=(0, 14), sticky=tk.W)
+            row += 1
+
+        # —— 按钮行 ——
+        btn_row = tk.Frame(win, bg=C_BG)
+        btn_row.grid(row=row, column=0, columnspan=3, padx=14, pady=(12, 14), sticky=tk.E)
+
+        def make_btn(text, cmd, danger=False):
+            return tk.Button(
+                btn_row,
+                text=text,
+                command=cmd,
+                bg=C_DANGER if danger else C_CARD,
+                fg="#ffffff" if danger else C_TEXT,
+                activebackground=C_CARD_HOVER,
+                activeforeground=C_TEXT,
+                relief=tk.FLAT,
+                font=("Microsoft YaHei UI", 10),
+                padx=12,
+                pady=3,
+                cursor="hand2",
+            )
+
+        make_btn("测试连接", lambda: self._settings_test(win, entries, enabled_var)).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        make_btn(
+            "恢复默认", lambda: self._settings_reset(win, entries, enabled_var), danger=True
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        make_btn("保存", lambda: self._settings_save(win, entries, enabled_var)).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        make_btn("完成", self._close_settings).pack(side=tk.LEFT)
+
+        self._settings_win = win
+        win.protocol("WM_DELETE_WINDOW", self._close_settings)
+        win.grab_set()  # 模态：设置窗口打开期间不操作主窗口
+        win.focus_set()
+
+    def _settings_collect(
+        self, entries: dict[str, tk.StringVar], enabled_var: tk.BooleanVar
+    ) -> dict[str, str]:
+        """从界面收集设置值。"""
+        values = {"CLIPVAULT_AI_ENABLED": "1" if enabled_var.get() else "0"}
+        for key, var in entries.items():
+            values[key] = var.get().strip()
+        return values
+
+    def _settings_save(
+        self, win, entries: dict[str, tk.StringVar], enabled_var: tk.BooleanVar
+    ) -> None:
+        """保存设置到 settings.json，并刷新 AI 相关界面状态。"""
+        config.save_settings(self._settings_collect(entries, enabled_var))
+        self._after_settings_changed()
+
+    def _settings_reset(
+        self, win, entries: dict[str, tk.StringVar], enabled_var: tk.BooleanVar
+    ) -> None:
+        """清除 GUI 覆盖，恢复「环境变量 + 默认值」并刷新界面值。"""
+        config.clear_settings()
+        enabled_var.set(
+            config.get_setting("CLIPVAULT_AI_ENABLED", "1").lower() not in ("0", "false", "no")
+        )
+        for key, var in entries.items():
+            var.set(config.get_setting(key, self._SETTINGS_DEFAULTS.get(key, "")))
+        self._after_settings_changed()
+
+    def _after_settings_changed(self) -> None:
+        """设置变更后的统一刷新：AI 状态、模式按钮、顶部按钮配色、提示。"""
+        self.ai_configured = ai_client.is_configured()
+        self._rebuild_mode_buttons()
+        self.settings_btn.configure(fg=C_ACCENT if self.ai_configured else C_DIM)
+        self._toast(
+            "✅ AI 设置已保存，对新内容即时生效"
+            if self.ai_configured
+            else "AI 已停用（未配置或已关闭），搜索使用关键词模式"
+        )
+
+    def _settings_test(
+        self, win, entries: dict[str, tk.StringVar], enabled_var: tk.BooleanVar
+    ) -> None:
+        """先保存当前界面值，再后台测试一次向量接口（避免阻塞 UI）。"""
+        self._settings_save(win, entries, enabled_var)
+        if not ai_client.is_configured():
+            messagebox.showwarning("连接测试", "尚未配置 API Key 或 AI 已停用。", parent=win)
+            return
+        self._toast("正在测试连接…")
+
+        def _run():
+            vector = ai_client.embed_text("连接测试")
+            if vector:
+                message = f"连接成功！向量维度 {len(vector)}。"
+            else:
+                message = "连接失败：请检查 API Key / 接口地址 / 网络。"
+            self.root.after(0, self._show_test_result, message)
+
+        import threading
+
+        threading.Thread(target=_run, name="clipvault-ai-test", daemon=True).start()
+
+    def _show_test_result(self, message: str) -> None:
+        """在主线程弹出连接测试结果。"""
+        if getattr(self, "_settings_win", None) is not None:
+            messagebox.showinfo("连接测试", message, parent=self._settings_win)
+
+    def _close_settings(self) -> None:
+        """关闭设置窗口（释放模态）。"""
+        win = getattr(self, "_settings_win", None)
+        if win is None:
+            return
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        win.destroy()
+        self._settings_win = None
 
     def _on_search_changed(self, *_args) -> None:
         """搜索防抖：停止输入 300ms 后才查询。"""

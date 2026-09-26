@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -88,3 +89,68 @@ def get_data_dir() -> Path:
     """数据目录：CLIPVAULT_DATA_DIR 优先，默认 <基准目录>/clipboard_data。"""
     raw = os.environ.get("CLIPVAULT_DATA_DIR", "").strip()
     return Path(raw).resolve() if raw else BASE_DIR / "clipboard_data"
+
+
+# ---------------------------------------------------------------------------
+# GUI 设置文件（settings.json）：界面上的配置保存于此
+#
+# 优先级：settings.json（界面设置） > 环境变量 / .env（高级用户） > 内置默认值。
+# 界面是用户最近一次显式操作，理应当场生效；需要环境变量覆盖的场景见 README。
+# 文件位于数据目录内（随数据目录走，已被 .gitignore）。
+# ---------------------------------------------------------------------------
+
+#: 设置缓存：{路径: (mtime, 数据)}，按 mtime 失效，外部改动也能感知
+_settings_cache: dict[str, tuple[float | None, dict]] = {}
+
+
+def settings_path() -> Path:
+    """设置文件路径：<数据目录>/settings.json。"""
+    return get_data_dir() / "settings.json"
+
+
+def _invalidate_settings_cache() -> None:
+    """清空设置缓存（保存 / 清除后立即调用，避免 mtime 精度问题）。"""
+    _settings_cache.clear()
+
+
+def load_settings() -> dict[str, str]:
+    """读取 settings.json；文件不存在或损坏时返回空字典（容错，不抛异常）。"""
+    path = settings_path()
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        _settings_cache.pop(str(path), None)
+        return {}
+    cached = _settings_cache.get(str(path))
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    _settings_cache[str(path)] = (mtime, data)
+    return data
+
+
+def save_settings(values: dict[str, str]) -> None:
+    """把界面设置写入 settings.json（自动建目录），并刷新缓存。"""
+    path = settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(values, ensure_ascii=False, indent=2), encoding="utf-8")
+    _invalidate_settings_cache()
+
+
+def clear_settings() -> None:
+    """删除 settings.json（恢复「环境变量 + 默认值」行为）。"""
+    settings_path().unlink(missing_ok=True)
+    _invalidate_settings_cache()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    """统一读取配置项：settings.json > 环境变量/.env > 默认值。"""
+    value = load_settings().get(key)
+    if value is not None and str(value).strip():
+        return str(value).strip()
+    return os.environ.get(key, "").strip() or default

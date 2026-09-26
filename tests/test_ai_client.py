@@ -10,12 +10,21 @@ import queue
 import pytest
 
 import ai_client
+import config
 import storage
+
+
+@pytest.fixture(autouse=True)
+def clean_settings():
+    """每个用例前后清空 GUI 设置，保证环境隔离。"""
+    config.clear_settings()
+    yield
+    config.clear_settings()
 
 
 @pytest.fixture
 def fake_key(monkeypatch):
-    """模拟「已配置 API Key」环境。"""
+    """模拟「系统环境已配置 API Key」场景。"""
     monkeypatch.setenv(ai_client.ENV_PREFIX + "API_KEY", "test-key-123")
     monkeypatch.setenv(ai_client.ENV_PREFIX + "ENABLED", "1")
     return monkeypatch
@@ -31,9 +40,34 @@ def test_not_configured_without_key(monkeypatch):
     assert ai_client.is_configured() is False
 
 
+def test_gui_settings_provide_key(fake_key):
+    """界面设置（settings.json）里的 Key 应被识别为已配置。"""
+    config.save_settings({ai_client.ENV_PREFIX + "API_KEY": "gui-key-123"})
+    assert ai_client.get_api_key() == "gui-key-123"
+    assert ai_client.is_configured() is True
+
+
+def test_gui_settings_override_env(fake_key):
+    """同名配置：界面设置优先于环境变量。"""
+    assert ai_client.get_api_key() == "test-key-123"
+    config.save_settings({ai_client.ENV_PREFIX + "API_KEY": "gui-key"})
+    assert ai_client.get_api_key() == "gui-key"
+
+
 def test_disabled_flag_wins(monkeypatch):
     monkeypatch.setenv(ai_client.ENV_PREFIX + "API_KEY", "k")
     monkeypatch.setenv(ai_client.ENV_PREFIX + "ENABLED", "0")
+    assert ai_client.is_configured() is False
+
+
+def test_disabled_via_gui_settings(fake_key):
+    """界面里关掉「启用 AI」= ENABLED=0 存入 settings.json。"""
+    config.save_settings(
+        {
+            ai_client.ENV_PREFIX + "API_KEY": "gui-key",
+            ai_client.ENV_PREFIX + "ENABLED": "0",
+        }
+    )
     assert ai_client.is_configured() is False
 
 

@@ -11,6 +11,7 @@
 - ⚡ **内容去重**：文本按 `sha256(text)`，图片按「转 RGB 后 PNG 字节」做像素级哈希，重复内容不重复入库
 - 🔍 **两级搜索**：关键词 LIKE 搜索（默认，纯本地）+ 语义向量搜索（可选 AI），窗口顶栏可切换「智能/关键词/语义」
 - 🏷️ **AI 分类**（可选）：新文本自动打标签（链接/代码/命令/邮箱电话/地址/账号凭证/笔记/其他），卡片上直接显示
+- ⚙ **AI 设置窗口**：顶栏「AI 设置」按钮直接在界面里配置 API Key / 接口地址 / 模型 / 分类 / 超时，保存到本地 settings.json **即时生效**，还能一键「测试连接」
 - 📌 **置顶 / 删除**：置顶条目置前排 + 黄色高亮 + 左侧强调条；删除两步确认，图片条目连带清理文件
 - 🎯 **一键复制**：点击卡片即把内容写回系统剪贴板——文本 `CF_UNICODETEXT`，图片同时写入 `CF_DIB + CF_BITMAP + PNG` 多种格式，**QQ / 微信 / 企业微信粘贴即用**
 - 🕐 **来源追溯**：每条记录来源应用（前台窗口标题）与复制时间
@@ -42,13 +43,14 @@ clipvault/
 ├── tray.py              # 托盘常驻版（采集 + GUI 一体，需 pystray）
 ├── autostart.py         # 开机自启动管理（HKCU Run 键，无需管理员权限）
 ├── make_icon.py         # 生成 assets/ 图标（托盘 + exe）
-├── tests/               # pytest 测试（53 个用例，含真实 GUI 冒烟）
+├── tests/               # pytest 测试（65 个用例，含真实 GUI 冒烟）
 │   ├── conftest.py      #   隔离数据目录 + 每用例清库 + 默认关闭 AI
+│   ├── test_config.py   #   设置文件读写 / 优先级 / 损坏容错
 │   ├── test_storage.py  #   建表/迁移/去重/列表搜索/置顶/删除/向量
 │   ├── test_watcher.py  #   哈希规则/命名/入库/去重/孤儿文件清理
 │   ├── test_ai_client.py#   降级/解析/相似度/后台队列
 │   ├── test_clipwriter.py#  格式转换 + QQ/微信多格式剪贴板（真实剪贴板验证）
-│   └── test_gui.py      #   真实 tkinter 窗口冒烟（渲染/筛选/置顶/删除两步/复制）
+│   └── test_gui.py      #   真实 tkinter 窗口冒烟（渲染/筛选/置顶/删除两步/复制/设置窗）
 ├── assets/              # 图标（make_icon.py 生成）
 ├── packaging.spec       # PyInstaller 打包配置
 ├── pyproject.toml       # 项目元数据 / 依赖 / 命令行入口 / ruff / pytest
@@ -123,34 +125,34 @@ python autostart.py remove     # 移除
 | 搜索 | 顶部搜索框输入关键词（300ms 防抖，无需回车）|
 | 切换检索模式 | 顶栏「智能 / 关键词 / 语义」（配置 AI 后才显示）|
 | 筛选类型 | 「全部 / 文本 / 图片」|
+| 配置 AI | 顶栏「AI 设置」按钮（托盘模式也可从托盘菜单进入）|
 | 复制回剪贴板 | **点击卡片**（可直接粘贴到 QQ/微信）|
 | 置顶 / 取消 | 鼠标悬停卡片 → 右上角「置顶」按钮 |
 | 删除 | 悬停卡片 → 「删除」按钮（需点两次确认）|
 
-## 🤖 AI 配置（可选）
+## 🤖 AI 配置（可选，界面直接配）
 
-AI 用于**自动分类**与**语义搜索**；不配置则相关入口自动隐藏，功能降级为纯关键词搜索。API Key 只从环境变量读取，不硬编码。
+**打开窗口顶栏的「AI 设置」按钮**（托盘模式在托盘菜单里也有入口），直接填写：
 
-```powershell
-# 复制模板并按需修改（.env 已被 .gitignore，不会进仓库）
-copy .env.example .env
-```
-
-| 变量 | 说明 | 默认 |
+| 界面项 | 说明 | 默认 |
 |---|---|---|
-| `CLIPVAULT_AI_API_KEY` | API Key（**必填**，不配则 AI 关闭）| 无 |
-| `CLIPVAULT_AI_BASE_URL` | OpenAI 兼容接口地址 | `https://api.openai.com/v1` |
-| `CLIPVAULT_AI_CHAT_MODEL` | 分类模型 | `gpt-4o-mini` |
-| `CLIPVAULT_AI_EMBED_MODEL` | 向量模型 | `text-embedding-3-small` |
-| `CLIPVAULT_AI_CATEGORIES` | 候选分类（逗号分隔）| 链接,代码,命令,邮箱电话,地址,账号凭证,笔记,其他 |
-| `CLIPVAULT_AI_TIMEOUT` | 单次请求超时（秒）| `10` |
-| `CLIPVAULT_AI_ENABLED` | `0` = 强制关闭 AI | `1` |
+| 启用 AI 功能 | 总开关，关掉后全部走关键词搜索 | 开 |
+| API Key | 只存本机 `clipboard_data/settings.json`，不硬编码、不进仓库 | 无 |
+| 接口地址 Base URL | 任何 OpenAI 兼容服务（官方 / 代理 / 本地 vLLM / Ollama）| `https://api.openai.com/v1` |
+| 分类模型 / 向量模型 | 按服务商选 | `gpt-4o-mini` / `text-embedding-3-small` |
+| 候选分类（逗号分隔） | 用于新文本自动打标签 | 链接、代码、命令、邮箱电话、地址、账号凭证、笔记、其他 |
+| 请求超时（秒） | 单次请求超时 | `10` |
 
-任何 OpenAI 兼容服务均可（官方 API、代理、本地 vLLM/Ollama）。配置后新复制的文本会自动分类；搜索切到「语义」可按意思找内容；存量文本点托盘菜单「立即补建语义向量」补建索引。
+填完点「保存」**即时生效**（新复制的内容自动分类、语义搜索可用）；「测试连接」可立刻验证 Key 和网络是否通；「恢复默认」清除界面配置，回到「环境变量 + 默认值」行为。
+
+**优先级**：界面设置（settings.json）> 环境变量 / `.env` > 内置默认值。界面是最近一次显式操作，当场生效；想用环境变量锁定配置，清空界面设置即可。
+
+> 备选：也可以 `copy .env.example .env` 用环境变量配置（适合脚本/部署场景），效果等同。
 
 ## 🗄️ 数据说明
 
 - **数据库**：`clipboard_data/clipboard.db`，WAL 模式，采集线程写、界面读并发不阻塞
+- **AI 设置**：`clipboard_data/settings.json`（界面「AI 设置」保存的 API 配置，仅存本机，已被 gitignore）
 - **图片**：`clipboard_data/images/` 下原图 + `thumb_` 前缀缩略图；数据库只存**相对数据目录**的路径（如 `images/thumb_xxx.png`），数据目录整体搬家后路径依然有效
 - **去重**：`content_hash` 字段带 UNIQUE 约束；`watcher.last_hash` 记忆最近一次内容，双重保险
 - **语义向量**：`clip_vectors` 表，float32 小端 BLOB（**是文本向量，不是图片**；图片仍然只存路径）
@@ -199,7 +201,7 @@ pyinstaller packaging.spec
 
 ```powershell
 pip install -e ".[dev]"
-pytest                        # 53 个用例，无需网络；GUI 用例需要桌面环境
+pytest                        # 65 个用例，无需网络；GUI 用例需要桌面环境
 ruff check .                  # 代码规范检查
 ```
 

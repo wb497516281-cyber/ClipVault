@@ -94,6 +94,13 @@ class TrayApp:
         self.root.after(0, self.root.deiconify)
         self.root.after(0, self.root.lift)
 
+    def open_settings(self, icon=None, item=None) -> None:
+        """打开 GUI 的 AI 设置窗口（跨线程，走主线程 after）。"""
+        if self._gui is None:
+            return
+        self.root.after(0, self._gui.open_settings)
+        self.root.after(0, self.root.deiconify)
+
     def toggle_pause(self, icon=None, item=None) -> None:
         if self.pause_event.is_set():
             self.pause_event.clear()
@@ -164,6 +171,7 @@ class TrayApp:
         """构建托盘菜单（pystray 支持 callable 文本/勾选/置灰）。"""
         return pystray.Menu(
             pystray.MenuItem("打开界面", self.open_window, default=True),
+            pystray.MenuItem("AI 设置…", self.open_settings),
             pystray.MenuItem("暂停采集", self.toggle_pause, checked=self.is_paused),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("开机自启动", self.toggle_autostart, checked=self.autostart_enabled),

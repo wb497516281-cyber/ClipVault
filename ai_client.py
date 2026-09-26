@@ -19,19 +19,22 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
 import queue
 import threading
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
 
+import config
 import storage
 
 logger = logging.getLogger("clipvault.ai")
 
 # ---------------------------------------------------------------------------
-# 环境变量（全部可选；key 缺失即视为未配置）
+# AI 配置项（全部可选；key 缺失即视为未配置）
+#
+# 读取走 config.get_setting：界面设置（settings.json）> 环境变量/.env > 默认值。
+# 用户在 GUI「AI 设置」窗口里改的值保存到 settings.json，立即生效。
 # ---------------------------------------------------------------------------
 
 ENV_PREFIX = "CLIPVAULT_AI_"
@@ -53,19 +56,18 @@ REQUEST_TIMEOUT = 10.0
 
 
 def _get_setting(name: str, default: str) -> str:
-    """读取 CLIPVAULT_AI_* 环境变量。"""
-    value = os.environ.get(ENV_PREFIX + name, "").strip()
-    return value or default
+    """读取 CLIPVAULT_AI_* 配置（界面设置 > 环境变量 > 默认值）。"""
+    return config.get_setting(ENV_PREFIX + name, default)
 
 
 def get_api_key() -> str:
-    """API Key：只从环境变量 / .env 读取。"""
-    return os.environ.get(ENV_PREFIX + "API_KEY", "").strip()
+    """API Key：来自界面设置或环境变量 / .env，绝不硬编码进代码。"""
+    return config.get_setting(ENV_PREFIX + "API_KEY")
 
 
 def is_enabled() -> bool:
     """AI 是否显式关闭：CLIPVAULT_AI_ENABLED=0 时强制关闭。"""
-    return os.environ.get(ENV_PREFIX + "ENABLED", "1").strip().lower() not in ("0", "false", "no")
+    return _get_setting("ENABLED", "1").lower() not in ("0", "false", "no")
 
 
 def is_configured() -> bool:

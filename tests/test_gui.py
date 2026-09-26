@@ -174,3 +174,50 @@ def test_gui_copy_actions_do_not_crash(window):
             win32clipboard.CloseClipboard()
     except Exception:
         pass  # 剪贴板不可用的环境跳过校验
+
+
+def test_gui_settings_window_saves_to_settings_json(window):
+    """AI 设置：打开设置窗 -> 保存配置 -> settings.json 落盘、模式按钮出现/消失。"""
+    import config
+    from gui import ClipVaultGUI
+
+    _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+    assert gui.mode_buttons == {}  # 未配置 AI：没有模式按钮
+
+    # 打开设置窗口（模态 Toplevel）
+    gui.open_settings()
+    window.update()
+    assert gui._settings_win is not None
+    assert gui._settings_win.title() == "AI 设置"
+
+    # 模拟界面填写后点「保存」：写入 settings.json 并触发统一刷新
+    values = {
+        "CLIPVAULT_AI_ENABLED": "1",
+        "CLIPVAULT_AI_API_KEY": "sk-gui-test",
+        "CLIPVAULT_AI_BASE_URL": "https://example.com/v1",
+        "CLIPVAULT_AI_CHAT_MODEL": "gpt-4o-mini",
+        "CLIPVAULT_AI_EMBED_MODEL": "text-embedding-3-small",
+        "CLIPVAULT_AI_CATEGORIES": "链接,代码",
+        "CLIPVAULT_AI_TIMEOUT": "10",
+    }
+    config.save_settings(values)
+    gui._after_settings_changed()
+    window.update()
+
+    # 配置生效：模式按钮出现、设置按钮变为高亮色
+    assert gui.ai_configured is True
+    assert set(gui.mode_buttons.keys()) == {"auto", "keyword", "semantic"}
+    assert config.get_setting("CLIPVAULT_AI_API_KEY") == "sk-gui-test"
+    assert config.get_setting("CLIPVAULT_AI_CHAT_MODEL") == "gpt-4o-mini"
+
+    # 「恢复默认」：清除 settings.json 后模式按钮消失
+    config.clear_settings()
+    gui._after_settings_changed()
+    window.update()
+    assert gui.mode_buttons == {}
+
+    gui._close_settings()
+    window.update()
+    assert gui._settings_win is None
