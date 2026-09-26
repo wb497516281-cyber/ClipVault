@@ -299,9 +299,59 @@ def test_update_item_content_rejects_empty():
         storage.update_item_content(item_id, "   ")
 
 
+def test_update_item_content_rejects_image_item():
+    """图片条目不允许改内容（防止 content_type 与 text_content 错乱）。"""
+    image_id = storage.insert_item(
+        "image", content_hash="e2", image_path="a.png", thumbnail_path="thumb_a.png"
+    )
+    with pytest.raises(ValueError):
+        storage.update_item_content(image_id, "新内容")
+
+
+def test_update_item_content_rejects_missing_item():
+    """条目不存在时抛错（而不是静默 no-op 让 GUI 误报已保存）。"""
+    with pytest.raises(ValueError):
+        storage.update_item_content(999999, "新内容")
+
+
+def test_update_item_content_clears_category():
+    """改内容后旧分类失效：category 被清空（等 AI 重新分类）。"""
+    item_id = storage.insert_item("text", content_hash="g1", text_content="旧")
+    storage.set_category(item_id, "代码")
+    storage.update_item_content(item_id, "新")
+    assert storage.get_item(item_id)["category"] is None
+
+
 def test_update_item_content_clears_vector():
     """内容变了旧向量失效：应被清掉（等 AI 队列重建）。"""
     item_id = storage.insert_item("text", content_hash="f1", text_content="旧")
     storage.upsert_vector(item_id, [1.0], "m")
     storage.update_item_content(item_id, "新")
     assert storage.load_vectors() == []
+
+
+def test_legacy_db_gains_title_column():
+    """老库（连 title 都没有）升级后应补齐 title 列。"""
+    storage.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if storage.DB_PATH.exists():
+        storage.DB_PATH.unlink()
+    with closing(sqlite3.connect(storage.DB_PATH)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE clipboard_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content_type TEXT NOT NULL,
+                text_content TEXT,
+                image_path TEXT,
+                thumbnail_path TEXT,
+                content_hash TEXT NOT NULL UNIQUE,
+                source_app TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    storage.init_db()
+    with closing(storage.get_connection()) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(clipboard_items)")}
+    assert "title" in columns

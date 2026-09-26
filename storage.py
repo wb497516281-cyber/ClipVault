@@ -110,11 +110,14 @@ def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     IMAGE_DIR.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(DB_PATH, timeout=5)) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
+        mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        if str(mode).lower() != "wal":
+            # 极少数并发初始化/文件系统不支持时会留在 delete 模式，功能不受影响但记一笔
+            print(f"[提示] SQLite WAL 模式未生效（当前 {mode}），并发性能可能下降", flush=True)
         # 顺序很重要：先建表 -> 再补列（老库迁移）-> 最后建索引。
         # 索引里引用了 is_pinned 等后加的列，补列前建索引会在老库上报错。
         conn.executescript(CREATE_TABLE_SQL + CREATE_VECTORS_TABLE_SQL)
-        _ensure_optional_columns(conn)  # 老库自动补齐置顶/分类相关列
+        _ensure_optional_columns(conn)  # 老库自动补齐置顶/分类/名称相关列
         conn.executescript(CREATE_INDEX_SQL)
         conn.commit()
 
@@ -400,26 +403,35 @@ class ContentConflictError(Exception):
 
 
 def update_item_content(item_id: int, new_text: str) -> None:
-    """修改文本条目的内容（内容哈希同步重算）。
+    """修改文本条目的内容（内容哈希同步重算，分类与旧向量失效）。
 
-    与其它条目内容撞车时抛 ContentConflictError，不做修改。
+    - 与其它条目内容撞车时抛 ContentConflictError，不做修改；
+    - 内容为空抛 ValueError；
+    - 对图片条目不存在的 id 调用抛 ValueError（避免 GUI 误报成功）。
+    冲突检查 + 内容更新 + 向量清理在同一事务内完成，杜绝中间态。
     """
     new_text = new_text.strip()
     if not new_text:
         raise ValueError("内容不能为空")
     digest = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
-    with closing(get_connection()) as conn:
-        row = conn.execute(
-            "SELECT id FROM clipboard_items WHERE content_hash = ? AND id != ?",
-            (digest, item_id),
-        ).fetchone()
-        if row is not None:
-            raise ContentConflictError("修改后的内容与另一条记录重复")
-        conn.execute(
-            "UPDATE clipboard_items SET text_content = ?, content_hash = ? WHERE id = ?",
-            (new_text, digest, item_id),
-        )
-        conn.commit()
-        # 内容变了，旧向量失效：一并清掉，等 AI 队列重建
-        conn.execute("DELETE FROM clip_vectors WHERE item_id = ?", (item_id,))
-        conn.commit()
+    try:
+        with closing(get_connection()) as conn:
+            with conn:  # 单事务：异常自动回滚
+                row = conn.execute(
+                    "SELECT content_type FROM clipboard_items WHERE id = ?", (item_id,)
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"条目 {item_id} 不存在")
+                if row["content_type"] != "text":
+                    raise ValueError("图片条目不支持修改内容")
+                # 检查-写入之间有并发插入同内容行的可能：UNIQUE 约束兜底
+                conn.execute(
+                    "UPDATE clipboard_items SET text_content = ?, content_hash = ?,"
+                    " category = NULL WHERE id = ?",
+                    (new_text, digest, item_id),
+                )
+                # 内容变了旧向量失效：一并清掉，等 AI 队列重建
+                conn.execute("DELETE FROM clip_vectors WHERE item_id = ?", (item_id,))
+    except sqlite3.IntegrityError as exc:
+        # UNIQUE 冲突：并发场景下另一条已占用该内容
+        raise ContentConflictError("修改后的内容与另一条记录重复") from exc

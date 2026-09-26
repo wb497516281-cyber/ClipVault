@@ -267,9 +267,14 @@ def process_image(image: Image.Image, source_app: str) -> None:
 
 
 def process_text(text: str, source_app: str) -> None:
-    """处理剪贴板文本：sha256 去重 → 直接写库。"""
+    """处理剪贴板文本：sha256 去重 → 直接写库。
+
+    哈希口径与 storage.update_item_content 保持一致：先 strip 再哈希/入库。
+    复制内容常带尾部换行，不统一口径会导致编辑后再复制同内容插入重复行。
+    """
     global last_hash
 
+    text = text.strip()
     if not text:
         return
 

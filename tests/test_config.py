@@ -20,6 +20,69 @@ def clean_settings():
     config.clear_settings()
 
 
+# ---------------------------------------------------------------------------
+# .env 解析
+# ---------------------------------------------------------------------------
+
+
+def test_load_env_file_basic(tmp_path, monkeypatch):
+    """基本解析：KEY=VALUE 入环境，不覆盖已有变量。"""
+    env = tmp_path / ".env"
+    env.write_text("FOO_KEY=bar\nIGNORED\n", encoding="utf-8")
+    monkeypatch.delenv("FOO_KEY", raising=False)
+    monkeypatch.setenv("EXISTING_KEY", "keep")
+    env.write_text("FOO_KEY=bar\nEXISTING_KEY=override\n", encoding="utf-8")
+    config.load_env_file(env)
+    import os
+
+    assert os.environ["FOO_KEY"] == "bar"
+    assert os.environ["EXISTING_KEY"] == "keep"  # 不覆盖已有
+
+
+def test_load_env_file_quotes_export_and_comment(tmp_path, monkeypatch):
+    """成对引号 / export 前缀 / 行内注释 / 空行注释行。"""
+    env = tmp_path / ".env"
+    env.write_text(
+        "# 注释行\n"
+        "\n"
+        'export QUOTED="hello world"\n'
+        "SINGLE='single'\n"
+        "WITH_COMMENT=value # 这是备注\n"
+        "NO_EQUALS_LINE\n",
+        encoding="utf-8",
+    )
+    for key in ("QUOTED", "SINGLE", "WITH_COMMENT"):
+        monkeypatch.delenv(key, raising=False)
+    config.load_env_file(env)
+    import os
+
+    assert os.environ["QUOTED"] == "hello world"
+    assert os.environ["SINGLE"] == "single"
+    assert os.environ["WITH_COMMENT"] == "value"
+
+
+def test_load_env_file_bom(tmp_path, monkeypatch):
+    """记事本另存的带 BOM .env：首个键名不能带 \\ufeff。"""
+    env = tmp_path / ".env"
+    env.write_bytes("BOM_KEY=first\n".encode("utf-8-sig"))
+    monkeypatch.delenv("BOM_KEY", raising=False)
+    config.load_env_file(env)
+    import os
+
+    assert os.environ["BOM_KEY"] == "first"
+
+
+def test_load_env_file_non_utf8_does_not_crash(tmp_path, monkeypatch):
+    """GBK 等非 UTF-8 .env 不能让进程崩（errors=replace 容错）。"""
+    env = tmp_path / ".env"
+    env.write_bytes("GBK_KEY=中文".encode("gbk"))
+    monkeypatch.delenv("GBK_KEY", raising=False)
+    config.load_env_file(env)  # 不抛异常即通过
+    import os
+
+    assert "GBK_KEY" in os.environ
+
+
 def test_save_and_load_roundtrip():
     values = {
         "CLIPVAULT_AI_API_KEY": "sk-test-123",
@@ -88,6 +151,15 @@ def test_external_edit_invalidates_cache():
     os.utime(path, (future, future))
 
     assert config.get_setting("CLIPVAULT_AI_CHAT_MODEL", "") == "model-b"
+
+
+def test_save_settings_is_atomic_no_tmp_left():
+    """保存走「临时文件 + os.replace」：不留 .tmp 残留，内容完整。"""
+    config.save_settings({"CLIPVAULT_AI_API_KEY": "k"})
+    leftovers = list(config.settings_path().parent.glob("*.tmp"))
+    assert leftovers == []
+    assert config.settings_path().exists()
+    assert config.load_settings()["CLIPVAULT_AI_API_KEY"] == "k"
 
 
 def test_clear_settings_removes_file():

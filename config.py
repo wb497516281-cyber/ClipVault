@@ -61,8 +61,9 @@ def load_env_file(path: Path | None = None) -> None:
     if not env_path.is_file():
         return
     try:
-        text = env_path.read_text(encoding="utf-8-sig")
-    except OSError:
+        # utf-8-sig 兼容 BOM；errors="replace" 防止 GBK 等非 UTF-8 文件让进程起不来
+        text = env_path.read_text(encoding="utf-8-sig", errors="replace")
+    except (OSError, UnicodeDecodeError):
         return
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -74,7 +75,10 @@ def load_env_file(path: Path | None = None) -> None:
         key = key.strip()
         if not key or key in os.environ:
             continue
-        value = value.strip().strip('"').strip("'")
+        value = value.strip()
+        # 只剥「成对」引号；不对称引号（如 'key）保持原样
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
         value = _strip_inline_comment(value)
         if value:
             os.environ[key] = value
@@ -114,7 +118,10 @@ def _invalidate_settings_cache() -> None:
 
 
 def load_settings() -> dict[str, str]:
-    """读取 settings.json；文件不存在或损坏时返回空字典（容错，不抛异常）。"""
+    """读取 settings.json；文件不存在或损坏时返回空字典（容错，不抛异常）。
+
+    返回缓存 dict 的副本，避免调用方不慎修改污染缓存。
+    """
     path = settings_path()
     try:
         mtime = path.stat().st_mtime
@@ -123,7 +130,7 @@ def load_settings() -> dict[str, str]:
         return {}
     cached = _settings_cache.get(str(path))
     if cached is not None and cached[0] == mtime:
-        return cached[1]
+        return dict(cached[1])
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -131,14 +138,20 @@ def load_settings() -> dict[str, str]:
     if not isinstance(data, dict):
         data = {}
     _settings_cache[str(path)] = (mtime, data)
-    return data
+    return dict(data)
 
 
 def save_settings(values: dict[str, str]) -> None:
-    """把界面设置写入 settings.json（自动建目录），并刷新缓存。"""
+    """把界面设置写入 settings.json（自动建目录），并刷新缓存。
+
+    先写临时文件再 os.replace 原子替换：崩溃/断电时不会留下半截文件
+    （否则 load_settings 会静默返回空 -> 用户以为配好的 Key 悄悄失效）。
+    """
     path = settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(values, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path = path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(values, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
     _invalidate_settings_cache()
 
 

@@ -192,9 +192,11 @@ def test_gui_settings_window_saves_to_settings_json(window):
     assert gui._settings_win is not None
     assert gui._settings_win.title() == "AI 设置"
 
-    # 厂商预设与模型下拉框存在
-    assert "OpenAI" in gui._settings_model_boxes or True  # 下拉框已建
-    assert len(gui._settings_model_boxes) == 2
+    # 两个模型下拉框已建立（分类/向量）
+    assert set(gui._settings_model_boxes.keys()) == {
+        "CLIPVAULT_AI_CHAT_MODEL",
+        "CLIPVAULT_AI_EMBED_MODEL",
+    }
 
     # 模拟界面填写后点「保存」：写入 settings.json 并触发统一刷新
     values = {
@@ -275,8 +277,83 @@ def test_gui_title_rendering_and_height(window):
     assert renamed.get("title") == "我的命名"
 
 
+def test_gui_editor_save_updates_content_and_title(window):
+    """编辑保存：改内容+命名落库，且内容变化会重新入队 AI 分析。"""
+    import tkinter as tk
+
+    import ai_client
+    import storage
+    from gui import ClipVaultGUI
+
+    _, text_id, _ = _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    enqueued: list[tuple] = []
+    original_is_configured = ai_client.is_configured
+    original_enqueue = ai_client.enqueue_analysis
+    ai_client.is_configured = lambda: True
+    ai_client.enqueue_analysis = lambda i, t: enqueued.append((i, t))
+    try:
+        # 伪造 content_box（.get 返回新内容）+ 命名
+        class _Box:
+            def get(self, *_args):
+                return "编辑后的新内容\n"
+
+        gui._save_editor(
+            window,
+            storage.get_item(text_id),
+            True,
+            _Box(),
+            tk.StringVar(value="新名字"),
+        )
+        window.update()
+    finally:
+        ai_client.is_configured = original_is_configured
+        ai_client.enqueue_analysis = original_enqueue
+
+    row = storage.get_item(text_id)
+    assert row["text_content"] == "编辑后的新内容"
+    assert row["title"] == "新名字"
+    assert enqueued == [(text_id, "编辑后的新内容")]  # H1 回归：编辑后重新入队
+
+
+def test_gui_editor_save_conflict_keeps_window(window, monkeypatch):
+    """编辑冲突：弹警告、不关窗、内容不变。"""
+    import hashlib
+    import tkinter as tk
+
+    import gui as gui_module
+    import storage
+    from gui import ClipVaultGUI
+
+    _, text_id, _ = _seed()
+    # 冲突检测按真实 sha256 比对，插入时要用真实哈希
+    storage.insert_item(
+        "text",
+        content_hash=hashlib.sha256("别人的内容".encode()).hexdigest(),
+        text_content="别人的内容",
+    )
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        gui_module.messagebox, "showwarning", lambda title, msg, parent=None: warnings.append(msg)
+    )
+
+    class _Box:
+        def get(self, *_args):
+            return "别人的内容"  # 与 other 撞车
+
+    gui._save_editor(window, storage.get_item(text_id), True, _Box(), tk.StringVar(value=""))
+    window.update()
+
+    assert warnings and "重复" in warnings[0]
+    assert storage.get_item(text_id)["text_content"] != "别人的内容"
+
+
 def test_gui_action_buttons_hit_test(window):
-    """三个悬停按钮（置顶/编辑/删除）的命中区域互不重叠且顺序正确。"""
     from gui import ClipVaultGUI
 
     image_id, text_id, _ = _seed()

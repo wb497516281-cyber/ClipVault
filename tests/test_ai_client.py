@@ -71,6 +71,33 @@ def test_disabled_via_gui_settings(fake_key):
     assert ai_client.is_configured() is False
 
 
+def test_local_base_needs_no_key(monkeypatch):
+    """Ollama 等本机服务免 Key：base 是 localhost 且未配 Key 也算已配置。"""
+    monkeypatch.delenv(ai_client.ENV_PREFIX + "API_KEY", raising=False)
+    monkeypatch.setattr(
+        ai_client,
+        "_get_setting",
+        lambda name, default: "http://localhost:11434/v1" if name == "BASE_URL" else default,
+    )
+    assert ai_client.is_configured() is True
+
+
+def test_timeout_falls_back_when_not_positive(monkeypatch):
+    """TIMEOUT 设为 0/负数/非法时回落默认，避免「AI 永远连不上」。"""
+    monkeypatch.setattr(
+        ai_client, "_get_setting", lambda name, default: "0" if name == "TIMEOUT" else default
+    )
+    assert ai_client.get_timeout() == ai_client.REQUEST_TIMEOUT
+    monkeypatch.setattr(
+        ai_client, "_get_setting", lambda name, default: "abc" if name == "TIMEOUT" else default
+    )
+    assert ai_client.get_timeout() == ai_client.REQUEST_TIMEOUT
+    monkeypatch.setattr(
+        ai_client, "_get_setting", lambda name, default: "3.5" if name == "TIMEOUT" else default
+    )
+    assert ai_client.get_timeout() == 3.5
+
+
 def test_degrade_when_not_configured(monkeypatch):
     """未配置时所有能力安全返回 None，不抛异常。"""
     monkeypatch.delenv(ai_client.ENV_PREFIX + "API_KEY", raising=False)
@@ -243,3 +270,36 @@ def test_enqueue_analysis_runs_worker_and_writes_db(fake_key, monkeypatch):
 
     assert ("cat", item_id, "代码") in written
     assert ("vec", item_id, (1.0, 0.0), ai_client.get_embed_model()) in written
+
+
+def test_worker_skips_stale_tasks(fake_key, monkeypatch):
+    """陈旧任务：入队后内容被编辑过，worker 不得把旧文本的结果写回。"""
+    import threading
+
+    item_id = storage.insert_item("text", content_hash="ai-2", text_content="旧内容")
+
+    # 门控保证顺序确定：worker 卡在 classify 里等门，测试改完内容再放行
+    gate = threading.Event()
+    worker_in = threading.Event()
+
+    def _slow_classify(text):
+        worker_in.set()
+        gate.wait(5)
+        return "代码"
+
+    monkeypatch.setattr(ai_client, "classify_text", _slow_classify)
+    monkeypatch.setattr(ai_client, "embed_text", lambda text: [1.0, 0.0])
+    written: list[tuple] = []
+    monkeypatch.setattr(storage, "set_category", lambda i, c: written.append(("cat", i, c)))
+    monkeypatch.setattr(
+        storage, "upsert_vector", lambda i, v, m: written.append(("vec", i, tuple(v), m))
+    )
+
+    ai_client.enqueue_analysis(item_id, "旧内容")
+    assert worker_in.wait(5)  # worker 已取出任务并卡在 classify
+    # 模拟用户在 worker 处理前编辑了该条（内容变、向量清、分类清）
+    storage.update_item_content(item_id, "新内容")
+    gate.set()  # 放行 worker 继续
+    ai_client._job_queue.join()
+
+    assert written == []  # 旧文本的分类/向量都没有写回

@@ -110,9 +110,17 @@ def is_enabled() -> bool:
     return _get_setting("ENABLED", "1").lower() not in ("0", "false", "no")
 
 
+def _is_local_base() -> bool:
+    """当前接口是否本机地址（Ollama 等本地服务无需 API Key）。"""
+    base = _get_setting("BASE_URL", API_BASE).strip().lower()
+    return base.startswith(("http://localhost", "http://127.0.0.1"))
+
+
 def is_configured() -> bool:
-    """是否具备调用条件：已配置 Key 且未被显式关闭。"""
-    return bool(get_api_key()) and is_enabled()
+    """是否具备调用条件：已配置 Key（或本机服务免 Key）且未被显式关闭。"""
+    if not is_enabled():
+        return False
+    return bool(get_api_key()) or _is_local_base()
 
 
 def get_categories() -> list[str]:
@@ -126,11 +134,12 @@ def get_categories() -> list[str]:
 
 
 def get_timeout() -> float:
-    """请求超时。"""
+    """请求超时（非正数/非法值回落默认，避免 urlopen 进入非阻塞）。"""
     try:
-        return float(_get_setting("TIMEOUT", str(REQUEST_TIMEOUT)))
+        value = float(_get_setting("TIMEOUT", str(REQUEST_TIMEOUT)))
     except ValueError:
         return REQUEST_TIMEOUT
+    return value if value > 0 else REQUEST_TIMEOUT
 
 
 def get_chat_model() -> str:
@@ -151,7 +160,7 @@ def get_embed_model() -> str:
 def _post_json(path: str, payload: dict) -> dict | None:
     """POST JSON 到 AI 接口；任何网络/协议错误都只记日志并返回 None。"""
     key = get_api_key()
-    if not key:
+    if not key and not _is_local_base():
         return None
     url = _get_setting("BASE_URL", API_BASE).rstrip("/") + path
     request = urllib.request.Request(
@@ -159,13 +168,13 @@ def _post_json(path: str, payload: dict) -> dict | None:
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {key}",
+            **({"Authorization": f"Bearer {key}"} if key else {}),
         },
         method="POST",
     )
     try:
         with urllib.request.urlopen(request, timeout=get_timeout()) as response:
-            return json.loads(response.read().decode("utf-8"))
+            return json.loads(response.read().decode("utf-8", errors="replace"))
     except (
         urllib.error.URLError,
         urllib.error.HTTPError,
@@ -190,7 +199,7 @@ def _get_json(path: str) -> dict | None:
     request = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=get_timeout()) as response:
-            return json.loads(response.read().decode("utf-8"))
+            return json.loads(response.read().decode("utf-8", errors="replace"))
     except (
         urllib.error.URLError,
         urllib.error.HTTPError,
@@ -333,14 +342,24 @@ _worker_started = False
 
 
 def _worker_loop() -> None:
-    """队列消费循环：对每条文本依次做分类与向量化，结果写回数据库。"""
+    """队列消费循环：对每条文本依次做分类与向量化，结果写回数据库。
+
+    陈旧校验放在「网络请求之后、写库之前」：用户在请求期间编辑该条
+    （内容变、向量已清）时丢弃结果，禁止把旧文本的向量/分类写回去
+    造成语义搜索错配。
+    """
     while True:
         item_id, text = _job_queue.get()
         try:
             category = classify_text(text)
+            vector = embed_text(text)
+            # 写回前最后校验一次内容（编辑常发生在网络请求耗时期间）
+            current = storage.get_item(item_id)
+            if current is None or (current.get("text_content") or "") != text:
+                logger.info("AI 任务过期已丢弃（id=%s，内容已被修改或删除）", item_id)
+                continue
             if category:
                 storage.set_category(item_id, category)
-            vector = embed_text(text)
             if vector:
                 storage.upsert_vector(item_id, vector, _get_setting("EMBED_MODEL", EMBED_MODEL))
         except Exception as exc:  # 兜底：绝不让守护线程退出

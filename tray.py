@@ -108,6 +108,21 @@ class TrayApp:
         else:
             self.pause_event.set()
             logger.info("采集已暂停")
+        self._refresh_tray_menu()
+
+    def _refresh_tray_menu(self) -> None:
+        """刷新托盘菜单。
+
+        pystray 的 win32 后端只在启动时构建一次 HMENU，checked/enabled/text
+        回调不会自动重生效；状态变化后必须显式 update_menu，否则勾选不动、
+        「立即补建语义向量」配好 AI 也点不了。
+        """
+        if self.icon is None:
+            return
+        try:
+            self.icon.update_menu()
+        except Exception as exc:  # pragma: no cover - 刷新失败不影响主流程
+            logger.debug("托盘菜单刷新失败：%s", exc)
 
     def is_paused(self, item) -> bool:
         return self.pause_event.is_set()
@@ -123,6 +138,7 @@ class TrayApp:
         except Exception as exc:
             logger.warning("切换开机自启动失败：%s", exc)
             self.notify(f"操作失败：{exc}")
+        self._refresh_tray_menu()
 
     def autostart_enabled(self, item) -> bool:
         return autostart.is_installed()
@@ -184,11 +200,13 @@ class TrayApp:
     def run(self) -> None:
         """组装并进入 tkinter 主循环（阻塞）。"""
         self.start_collector()
+        # 先建 GUI（托盘菜单要操作它），再起托盘线程
+        self._gui = ClipVaultGUI(self.root)
+        # GUI 设置变更后刷新托盘动态菜单（AI 状态/补建向量置灰）
+        self._gui.notify_hook = self._refresh_tray_menu
         tray_ok = self.start_tray()
         if not tray_ok:
             print('未安装 pystray，本次以纯窗口模式运行（pip install -e ".[tray]" 可启用托盘）。')
-
-        self._gui = ClipVaultGUI(self.root)
 
         def on_close():
             if tray_ok:
@@ -218,10 +236,13 @@ class TrayApp:
             self.icon.stop()
 
     def _load_icon_image(self):
-        """加载托盘图标；文件缺失时现画一个 64x64 的兜底图标。"""
+        """加载托盘图标；文件缺失/损坏时现画一个 64x64 的兜底图标。"""
         if ICON_PATH.is_file():
-            with Image.open(ICON_PATH) as im:
-                return im.copy()  # copy 后关闭文件句柄
+            try:
+                with Image.open(ICON_PATH) as im:
+                    return im.copy()  # copy 后关闭文件句柄
+            except Exception as exc:
+                logger.warning("托盘图标加载失败，使用兜底图标：%s", exc)
         image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         from PIL import ImageDraw
 

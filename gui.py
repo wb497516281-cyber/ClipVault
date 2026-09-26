@@ -4,11 +4,12 @@
 功能：
   1. 顶部搜索框（300ms 防抖）+ 类型筛选（全部/文本/图片）；
   2. 配置 AI 后出现检索模式切换（智能/关键词/语义）；
-  3. 卡片：文本显示前若干字符，图片显示缩略图；元信息含时间/来源/类型/AI 分类；
+  3. 卡片：文本显示前若干字符，图片显示缩略图；元信息含时间/来源/类型/AI 分类/名称；
   4. 点击卡片 → 写回系统剪贴板（文本 CF_UNICODETEXT；图片多格式，QQ/微信可粘贴）；
-  5. 悬停卡片出现「置顶 / 删除」按钮；删除两步确认；
+  5. 悬停卡片出现「置顶 / 编辑 / 删除」按钮；删除两步确认；
   6. 置顶条目排最前且不同底色 + 左侧强调条；
-  7. 每 5 秒自动刷新（数据没变不重绘，不闪）；剪贴板采集在后台线程运行。
+  7. 每 5 秒自动刷新（数据没变不重绘，不闪）；剪贴板采集在后台线程运行；
+  8. 语义检索走后台线程 + 查询向量缓存，接口慢不冻结界面。
 
 运行：python gui.py            （默认同时启动采集器）
       python gui.py --no-watch （只看界面，不采集）
@@ -118,6 +119,8 @@ class ClipVaultGUI:
         self._refresh_stopped = False  # 停止自动刷新链路用
         # 句柄挂到 root 上：测试复用同一根窗口 / 托盘拆卸时可停掉刷新链
         root._clipvault_gui = self  # noqa: SLF001
+        # 语义检索的查询向量缓存：同一查询词不反复请求接口
+        self._query_vec_cache: dict[str, list[float]] = {}
 
         self._build_widgets()
         self._load_and_render()
@@ -242,13 +245,15 @@ class ClipVaultGUI:
         self.toast_label.place_forget()
 
         # 窗口图标（assets/tray.png 存在时）
+        # 注意：图标引用单独持有 —— _img_refs 会在每次重绘时清空，
+        # 混用会导致窗口图标在某些平台被 GC。
         icon_path = BASE_DIR / "assets" / "tray.png"
         if icon_path.is_file():
             try:
                 from PIL import ImageTk
 
-                self._img_refs.append(ImageTk.PhotoImage(file=icon_path))
-                self.root.iconphoto(True, self._img_refs[-1])
+                self._icon_ref = ImageTk.PhotoImage(file=icon_path)
+                self.root.iconphoto(True, self._icon_ref)
             except Exception:
                 pass
 
@@ -284,25 +289,27 @@ class ClipVaultGUI:
             return ""
         return self.search_var.get().strip()
 
-    def _load_items(self) -> list[dict]:
-        """按当前搜索词/筛选/模式加载条目。"""
-        q = self._current_query()
-        use_semantic = self.mode == "semantic" or (self.mode == "auto" and self.ai_configured)
-        if q and use_semantic:
-            rows = self._semantic_rows(q) or storage.list_items(
-                q=q, limit=LIST_LIMIT, content_type=self.type_filter
-            )
-        elif q:
-            rows = storage.list_items(q=q, limit=LIST_LIMIT, content_type=self.type_filter)
-        else:
-            rows = storage.list_items(limit=LIST_LIMIT, content_type=self.type_filter)
-        return rows
+    def _load_items_sync(self, q: str) -> list[dict]:
+        """关键词/列表路径：纯本地 SQLite，同步执行无感知。"""
+        if q:
+            return storage.list_items(q=q, limit=LIST_LIMIT, content_type=self.type_filter)
+        return storage.list_items(limit=LIST_LIMIT, content_type=self.type_filter)
 
     def _semantic_rows(self, q: str) -> list[dict]:
-        """语义检索：查询词向量化后按余弦相似度排序；失败返回空列表（降级关键词）。"""
+        """语义检索：查询词向量化后按余弦相似度排序；失败返回空列表（降级关键词）。
+
+        查询向量带缓存：同一个查询词（含 5 秒自动刷新重复触发）不会反复请求接口。
+        """
         if not self.ai_configured:
             return []
-        query_vector = ai_client.embed_text(q)
+        if q in self._query_vec_cache:
+            query_vector = self._query_vec_cache[q]
+        else:
+            query_vector = ai_client.embed_text(q) or []
+            # 缓存上限 50 条，防止长期使用无限增长
+            if len(self._query_vec_cache) >= 50:
+                self._query_vec_cache.pop(next(iter(self._query_vec_cache)))
+            self._query_vec_cache[q] = query_vector
         if not query_vector:
             return []
         scored: list[tuple[float, int]] = []
@@ -320,13 +327,35 @@ class ClipVaultGUI:
             rows = [r for r in rows if r["content_type"] == self.type_filter]
         return rows
 
-    # ------------------------------------------------------------------
-    # 渲染（全部画在 Canvas 上）
-    # ------------------------------------------------------------------
-
     def _load_and_render(self) -> None:
-        """加载数据并渲染；数据没变（指纹一致）就跳过重绘。"""
-        self.items = self._load_items()
+        """加载数据并渲染。
+
+        语义检索涉及网络请求，放到后台线程执行，避免接口挂起时 UI 冻结；
+        关键词/列表路径是本地 SQLite，同步执行。
+        """
+        q = self._current_query()
+        use_semantic = bool(q) and (
+            self.mode == "semantic" or (self.mode == "auto" and self.ai_configured)
+        )
+        if use_semantic:
+            self._toast("🔍 语义检索中…")
+            threading.Thread(
+                target=self._semantic_worker, args=(q,), name="clipvault-search", daemon=True
+            ).start()
+        else:
+            self._apply_rows(self._load_items_sync(q))
+
+    def _semantic_worker(self, q: str) -> None:
+        """后台语义检索：失败/无结果时降级关键词，完成后回主线程渲染。"""
+        try:
+            rows = self._semantic_rows(q) or self._load_items_sync(q)
+        except Exception:
+            rows = self._load_items_sync(q)
+        self.root.after(0, self._apply_rows, rows)
+
+    def _apply_rows(self, rows: list[dict]) -> None:
+        """主线程渲染入口：数据没变（指纹一致）就跳过重绘。"""
+        self.items = rows
         fingerprint = "|".join(
             f"{r['id']}:{r['is_pinned']}:{r['category'] or ''}:{r['content_type']}:{r.get('title') or ''}"
             for r in self.items
@@ -335,6 +364,25 @@ class ClipVaultGUI:
             return
         self._fingerprint = fingerprint
         self._render()
+
+    def _refresh_hover_from_pointer(self) -> None:
+        """按当前鼠标位置重算悬停卡片。
+
+        置顶/删除/保存后卡片会重绘，若把 hovered_id 直接清空，按钮门控失效，
+        用户原地点按钮会退化成「复制卡片」——所以按指针真实位置恢复。
+        """
+        try:
+            px = self.canvas.winfo_pointerx() - self.canvas.winfo_rootx()
+            py = self.canvas.winfo_pointery() - self.canvas.winfo_rooty()
+        except Exception:
+            self.hovered_id = None
+            return
+        x, y = self.canvas.canvasx(px), self.canvas.canvasy(py)
+        self.hovered_id = None
+        for item_id, (cx, cy, cw, ch) in self._card_rects.items():
+            if cx <= x <= cx + cw and cy <= y <= cy + ch:
+                self.hovered_id = item_id
+                break
 
     def _render(self) -> None:
         """清空画布并按数据重绘所有卡片。"""
@@ -659,7 +707,8 @@ class ClipVaultGUI:
             return
         storage.update_pin(item_id, not bool(item["is_pinned"]))
         self._fingerprint = None  # 强制重绘（排序会变）
-        self.hovered_id = None
+        # 先按指针位置恢复悬停，再重绘：否则按钮门控失效，原地点按钮会退化成复制
+        self._refresh_hover_from_pointer()
         self._load_and_render()
         self._toast("📌 已置顶" if not item["is_pinned"] else "已取消置顶")
 
@@ -691,7 +740,8 @@ class ClipVaultGUI:
             if path.is_file() and storage.IMAGE_DIR in path.parents:
                 path.unlink()
         self._fingerprint = None
-        self.hovered_id = None
+        # 先按指针位置恢复悬停再重绘，避免按钮门控失效
+        self._refresh_hover_from_pointer()
         self._load_and_render()
         self._toast("🗑 已删除")
 
@@ -699,6 +749,7 @@ class ClipVaultGUI:
         self.type_filter = key
         for k, btn in self.type_buttons.items():
             btn.configure(bg=C_ACCENT if k == key else C_CARD, fg="#ffffff" if k == key else C_DIM)
+        self._cancel_pending_delete()  # 筛选项变化，作废未确认的删除
         self._fingerprint = None
         self._load_and_render()
 
@@ -758,7 +809,9 @@ class ClipVaultGUI:
         "CLIPVAULT_AI_BASE_URL": "https://api.openai.com/v1",
         "CLIPVAULT_AI_CHAT_MODEL": "gpt-4o-mini",
         "CLIPVAULT_AI_EMBED_MODEL": "text-embedding-3-small",
-        "CLIPVAULT_AI_CATEGORIES": "、".join(ai_client.DEFAULT_CATEGORIES),
+        # 注意：必须用英文逗号 —— ai_client.get_categories() 按 "," 分割，
+        # 用中文顿号会把全部分类黏成一个字符串
+        "CLIPVAULT_AI_CATEGORIES": ",".join(ai_client.DEFAULT_CATEGORIES),
         "CLIPVAULT_AI_TIMEOUT": "10",
     }
 
@@ -786,6 +839,12 @@ class ClipVaultGUI:
             existing.lift()
             existing.focus_set()
             return
+        # 模态互斥：编辑窗开着时先把编辑窗提到前面
+        if getattr(self, "_editor_win", None) is not None:
+            self._editor_win.lift()
+            self._editor_win.focus_set()
+            self._toast("请先关闭编辑窗")
+            return
 
         win = tk.Toplevel(self.root)
         win.title("AI 设置")
@@ -796,7 +855,6 @@ class ClipVaultGUI:
 
         entries: dict[str, tk.StringVar] = {}
         show_key = tk.BooleanVar(value=False)
-        model_boxes: dict[str, ttk.Combobox] = {}
 
         # —— 顶部说明 ——
         tk.Label(
@@ -838,6 +896,7 @@ class ClipVaultGUI:
                 current_provider = name
                 break
         provider_var = tk.StringVar(value=current_provider)
+        self._settings_provider_var = provider_var  # 恢复默认时要回退这个下拉
         provider_box = ttk.Combobox(
             win,
             textvariable=provider_var,
@@ -979,6 +1038,11 @@ class ClipVaultGUI:
             entries["CLIPVAULT_AI_CHAT_MODEL"].set(preset["chat"])
         if preset["embed"]:
             entries["CLIPVAULT_AI_EMBED_MODEL"].set(preset["embed"])
+        else:
+            # 该厂商没有向量接口：清空残留值，避免语义检索静默失效
+            entries["CLIPVAULT_AI_EMBED_MODEL"].set("")
+            self._toast(f"「{provider_var.get()}」无向量接口，语义搜索将不可用")
+            return
         self._toast(f"已应用「{provider_var.get()}」预设，填好 Key 后可点「拉取模型」")
 
     def _settings_fetch_models(
@@ -999,10 +1063,14 @@ class ClipVaultGUI:
         self._toast("正在拉取模型列表…")
 
         def _run():
-            models = ai_client.fetch_models()
-            self.root.after(0, self._fill_model_boxes, models)
-
-        import threading
+            # try/finally 保证无论成功失败都恢复 UI（否则 toast 永远停在「正在拉取」）
+            try:
+                models = ai_client.fetch_models()
+            except Exception as exc:
+                models = []
+                self.root.after(0, self._toast, f"拉取模型出错：{exc}", True)
+            finally:
+                self.root.after(0, self._fill_model_boxes, models)
 
         threading.Thread(target=_run, name="clipvault-fetch-models", daemon=True).start()
 
@@ -1044,6 +1112,18 @@ class ClipVaultGUI:
         )
         for key, var in entries.items():
             var.set(config.get_setting(key, self._SETTINGS_DEFAULTS.get(key, "")))
+        # 厂商下拉回退到「按当前 Base URL 识别」的结果；模型下拉清空拉取结果
+        provider_var = getattr(self, "_settings_provider_var", None)
+        if provider_var is not None:
+            current_base = config.get_setting("CLIPVAULT_AI_BASE_URL", "").strip().rstrip("/")
+            matched = "自定义"
+            for name, preset in ai_client.PROVIDERS.items():
+                if preset["base"] and preset["base"].rstrip("/") == current_base:
+                    matched = name
+                    break
+            provider_var.set(matched)
+        for box in getattr(self, "_settings_model_boxes", {}).values():
+            box.configure(values=())
         self._after_settings_changed()
 
     def _after_settings_changed(self) -> None:
@@ -1051,6 +1131,13 @@ class ClipVaultGUI:
         self.ai_configured = ai_client.is_configured()
         self._rebuild_mode_buttons()
         self.settings_btn.configure(fg=C_ACCENT if self.ai_configured else C_DIM)
+        # 通知外部（托盘）刷新动态菜单：pystray 菜单只构建一次，需显式 update_menu
+        hook = getattr(self, "notify_hook", None)
+        if hook is not None:
+            try:
+                hook()
+            except Exception:
+                pass
         self._toast(
             "✅ AI 设置已保存，对新内容即时生效"
             if self.ai_configured
@@ -1068,14 +1155,15 @@ class ClipVaultGUI:
         self._toast("正在测试连接…")
 
         def _run():
-            vector = ai_client.embed_text("连接测试")
-            if vector:
-                message = f"连接成功！向量维度 {len(vector)}。"
-            else:
-                message = "连接失败：请检查 API Key / 接口地址 / 网络。"
+            try:
+                vector = ai_client.embed_text("连接测试")
+                if vector:
+                    message = f"连接成功！向量维度 {len(vector)}。"
+                else:
+                    message = "连接失败：请检查 API Key / 接口地址 / 网络。"
+            except Exception as exc:
+                message = f"连接出错：{exc}"
             self.root.after(0, self._show_test_result, message)
-
-        import threading
 
         threading.Thread(target=_run, name="clipvault-ai-test", daemon=True).start()
 
@@ -1105,10 +1193,15 @@ class ClipVaultGUI:
         item = storage.get_item(item_id)
         if item is None:
             return
-        existing = getattr(self, "_editor_win", None)
-        if existing is not None:
-            existing.destroy()
-            self._editor_win = None
+        # 模态互斥：设置窗开着时先把设置窗提到前面，避免两个模态窗抢 grab
+        if getattr(self, "_settings_win", None) is not None:
+            self._settings_win.lift()
+            self._settings_win.focus_set()
+            self._toast("请先关闭 AI 设置窗")
+            return
+        # 已打开则先正常关闭（释放模态抓取），再开新的
+        if getattr(self, "_editor_win", None) is not None:
+            self._close_editor()
 
         win = tk.Toplevel(self.root)
         win.title("编辑条目")
@@ -1176,26 +1269,7 @@ class ClipVaultGUI:
         btn_row.grid(row=3, column=0, columnspan=2, padx=14, pady=(12, 14), sticky=tk.E)
 
         def on_save():
-            try:
-                if is_text and content_box is not None:
-                    new_text = content_box.get("1.0", tk.END).strip()
-                    if new_text and new_text != (item.get("text_content") or "").strip():
-                        storage.update_item_content(item_id, new_text)
-                new_title = title_var.get().strip()
-                if new_title != (item.get("title") or ""):
-                    storage.update_item_title(item_id, new_title)
-            except storage.ContentConflictError as exc:
-                messagebox.showwarning("无法保存", str(exc), parent=win)
-                return
-            except ValueError as exc:
-                messagebox.showwarning("无法保存", str(exc), parent=win)
-                return
-            # 内容/名称可能变化：强制刷新列表
-            self._fingerprint = None
-            self.hovered_id = None
-            self._load_and_render()
-            self._toast("✅ 已保存修改")
-            self._close_editor()
+            self._save_editor(win, item, is_text, content_box, title_var)
 
         tk.Button(
             btn_row,
@@ -1243,6 +1317,42 @@ class ClipVaultGUI:
             pass
         win.destroy()
         self._editor_win = None
+
+    def _save_editor(self, win, item: dict, is_text: bool, content_box, title_var) -> None:
+        """保存编辑窗：写回内容/名称，冲突或空值弹窗不关窗，成功则刷新列表。
+
+        抽出为方法以便测试驱动；content_box 只需提供 .get("1.0", END)。
+        """
+        try:
+            content_changed = False
+            new_text = ""
+            if is_text and content_box is not None:
+                new_text = content_box.get("1.0", tk.END).strip()
+                if not new_text and (item.get("text_content") or "").strip():
+                    # 清空内容不是「无操作」：明确拒绝并提示，不静默保存
+                    messagebox.showwarning("无法保存", "内容不能为空", parent=win)
+                    return
+                if new_text and new_text != (item.get("text_content") or "").strip():
+                    storage.update_item_content(item["id"], new_text)
+                    content_changed = True
+            new_title = title_var.get().strip()
+            if new_title != (item.get("title") or ""):
+                storage.update_item_title(item["id"], new_title)
+        except storage.ContentConflictError as exc:
+            messagebox.showwarning("无法保存", str(exc), parent=win)
+            return
+        except ValueError as exc:
+            messagebox.showwarning("无法保存", str(exc), parent=win)
+            return
+        # 内容改了：旧分类/向量已失效，重新入队 AI 分析（未配置 AI 时自动跳过）
+        if content_changed:
+            ai_client.enqueue_analysis(item["id"], new_text)
+        # 内容/名称可能变化：强制刷新列表（先恢复悬停再重绘）
+        self._fingerprint = None
+        self._refresh_hover_from_pointer()
+        self._load_and_render()
+        self._toast("✅ 已保存修改")
+        self._close_editor()
 
     def _on_search_changed(self, *_args) -> None:
         """搜索防抖：停止输入 300ms 后才查询。"""

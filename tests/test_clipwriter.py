@@ -9,12 +9,15 @@ import io
 import struct
 
 import pytest
-import win32clipboard
-import win32con
 from PIL import Image
 
 import clipwriter
 import storage
+
+# 剪贴板 API 仅 Windows 有：非 Windows 环境跳过整个文件
+pytest.importorskip("win32clipboard", reason="剪贴板测试仅支持 Windows")
+win32clipboard = pytest.importorskip("win32clipboard")
+win32con = pytest.importorskip("win32con")
 
 
 @pytest.fixture(autouse=True)
