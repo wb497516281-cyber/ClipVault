@@ -51,6 +51,46 @@ EMBED_MODEL = "text-embedding-3-small"
 #: 候选分类（可用 CLIPVAULT_AI_CATEGORIES 覆盖，逗号分隔）
 DEFAULT_CATEGORIES = ["链接", "代码", "命令", "邮箱电话", "地址", "账号凭证", "笔记", "其他"]
 
+#: 主流厂商预设：选中后自动填 Base URL 与默认模型（embed 为空 = 该厂商无向量接口）
+PROVIDERS: dict[str, dict[str, str]] = {
+    "OpenAI": {
+        "base": "https://api.openai.com/v1",
+        "chat": "gpt-4o-mini",
+        "embed": "text-embedding-3-small",
+    },
+    "DeepSeek": {
+        "base": "https://api.deepseek.com/v1",
+        "chat": "deepseek-chat",
+        "embed": "",
+    },
+    "通义千问": {
+        "base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "chat": "qwen-plus",
+        "embed": "text-embedding-v3",
+    },
+    "智谱 GLM": {
+        "base": "https://open.bigmodel.cn/api/paas/v4",
+        "chat": "glm-4-flash",
+        "embed": "embedding-2",
+    },
+    "Moonshot Kimi": {
+        "base": "https://api.moonshot.cn/v1",
+        "chat": "moonshot-v1-8k",
+        "embed": "",
+    },
+    "硅基流动 SiliconFlow": {
+        "base": "https://api.siliconflow.cn/v1",
+        "chat": "Qwen/Qwen2.5-7B-Instruct",
+        "embed": "BAAI/bge-m3",
+    },
+    "Ollama 本地": {
+        "base": "http://localhost:11434/v1",
+        "chat": "qwen2.5",
+        "embed": "nomic-embed-text",
+    },
+    "自定义": {"base": "", "chat": "", "embed": ""},
+}
+
 #: 单次请求超时（秒）
 REQUEST_TIMEOUT = 10.0
 
@@ -135,6 +175,47 @@ def _post_json(path: str, payload: dict) -> dict | None:
     ) as exc:
         logger.warning("AI 请求失败（%s）：%s", url, exc)
         return None
+
+
+def _get_json(path: str) -> dict | None:
+    """GET JSON（OpenAI 兼容接口）；配了 Key 自动带鉴权，失败只记日志返回 None。"""
+    base = _get_setting("BASE_URL", API_BASE).strip().rstrip("/")
+    if not base:
+        return None
+    url = base + path
+    headers = {"Content-Type": "application/json"}
+    key = get_api_key()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=get_timeout()) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        json.JSONDecodeError,
+        OSError,
+    ) as exc:
+        logger.warning("AI 请求失败（%s）：%s", url, exc)
+        return None
+
+
+def fetch_models() -> list[str]:
+    """拉取当前接口的可用模型列表（GET /models），按 ID 排序去重。
+
+    用户在设置窗口填好 URL 和 Key 后点「拉取模型」，即可把模型列表
+    填进分类/向量模型下拉框。失败（网络错/Key 错/接口不兼容）返回空列表。
+    """
+    data = _get_json("/models")
+    if not data:
+        return []
+    rows = data.get("data")
+    if not isinstance(rows, list):
+        return []
+    ids = [str(row.get("id")) for row in rows if isinstance(row, dict) and row.get("id")]
+    return sorted(dict.fromkeys(ids))
 
 
 # ---------------------------------------------------------------------------

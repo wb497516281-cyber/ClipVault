@@ -12,6 +12,8 @@
 - 🔍 **两级搜索**：关键词 LIKE 搜索（默认，纯本地）+ 语义向量搜索（可选 AI），窗口顶栏可切换「智能/关键词/语义」
 - 🏷️ **AI 分类**（可选）：新文本自动打标签（链接/代码/命令/邮箱电话/地址/账号凭证/笔记/其他），卡片上直接显示
 - ⚙ **AI 设置窗口**：顶栏「AI 设置」按钮直接在界面里配置 API Key / 接口地址 / 模型 / 分类 / 超时，保存到本地 settings.json **即时生效**，还能一键「测试连接」
+- 🏭 **主流厂商预设**：OpenAI / DeepSeek / 通义千问 / 智谱 GLM / Moonshot / 硅基流动 / Ollama 本地，选中即填好地址和默认模型；填好 URL+Key 点「拉取模型」自动获取该账号可用的模型列表填进下拉框
+- ✏️ **条目编辑**：悬停卡片点「编辑」，可修改文本内容、给条目命名（名称高亮显示在卡片顶部）；图片条目支持命名
 - 📌 **置顶 / 删除**：置顶条目置前排 + 黄色高亮 + 左侧强调条；删除两步确认，图片条目连带清理文件
 - 🎯 **一键复制**：点击卡片即把内容写回系统剪贴板——文本 `CF_UNICODETEXT`，图片同时写入 `CF_DIB + CF_BITMAP + PNG` 多种格式，**QQ / 微信 / 企业微信粘贴即用**
 - 🕐 **来源追溯**：每条记录来源应用（前台窗口标题）与复制时间
@@ -43,14 +45,14 @@ clipvault/
 ├── tray.py              # 托盘常驻版（采集 + GUI 一体，需 pystray）
 ├── autostart.py         # 开机自启动管理（HKCU Run 键，无需管理员权限）
 ├── make_icon.py         # 生成 assets/ 图标（托盘 + exe）
-├── tests/               # pytest 测试（65 个用例，含真实 GUI 冒烟）
+├── tests/               # pytest 测试（77 个用例，含真实 GUI 冒烟）
 │   ├── conftest.py      #   隔离数据目录 + 每用例清库 + 默认关闭 AI
 │   ├── test_config.py   #   设置文件读写 / 优先级 / 损坏容错
-│   ├── test_storage.py  #   建表/迁移/去重/列表搜索/置顶/删除/向量
+│   ├── test_storage.py  #   建表/迁移/去重/列表搜索/置顶/删除/编辑命名/向量
 │   ├── test_watcher.py  #   哈希规则/命名/入库/去重/孤儿文件清理
-│   ├── test_ai_client.py#   降级/解析/相似度/后台队列
+│   ├── test_ai_client.py#   降级/解析/相似度/队列/厂商预设/拉取模型
 │   ├── test_clipwriter.py#  格式转换 + QQ/微信多格式剪贴板（真实剪贴板验证）
-│   └── test_gui.py      #   真实 tkinter 窗口冒烟（渲染/筛选/置顶/删除两步/复制/设置窗）
+│   └── test_gui.py      #   真实 tkinter 窗口冒烟（渲染/筛选/置顶/删除两步/复制/设置窗/编辑窗）
 ├── assets/              # 图标（make_icon.py 生成）
 ├── packaging.spec       # PyInstaller 打包配置
 ├── pyproject.toml       # 项目元数据 / 依赖 / 命令行入口 / ruff / pytest
@@ -126,6 +128,7 @@ python autostart.py remove     # 移除
 | 切换检索模式 | 顶栏「智能 / 关键词 / 语义」（配置 AI 后才显示）|
 | 筛选类型 | 「全部 / 文本 / 图片」|
 | 配置 AI | 顶栏「AI 设置」按钮（托盘模式也可从托盘菜单进入）|
+| 编辑条目 | 悬停卡片 → 「编辑」按钮（改文本内容 / 命名）|
 | 复制回剪贴板 | **点击卡片**（可直接粘贴到 QQ/微信）|
 | 置顶 / 取消 | 鼠标悬停卡片 → 右上角「置顶」按钮 |
 | 删除 | 悬停卡片 → 「删除」按钮（需点两次确认）|
@@ -144,6 +147,21 @@ python autostart.py remove     # 移除
 | 请求超时（秒） | 单次请求超时 | `10` |
 
 填完点「保存」**即时生效**（新复制的内容自动分类、语义搜索可用）；「测试连接」可立刻验证 Key 和网络是否通；「恢复默认」清除界面配置，回到「环境变量 + 默认值」行为。
+
+**厂商预设**：设置窗顶部下拉选择厂商，自动填好 Base URL 和默认模型：
+
+| 预设 | Base URL | 默认分类模型 | 默认向量模型 |
+|---|---|---|---|
+| OpenAI | api.openai.com/v1 | gpt-4o-mini | text-embedding-3-small |
+| DeepSeek | api.deepseek.com/v1 | deepseek-chat | （无向量接口）|
+| 通义千问 | dashscope.aliyuncs.com/compatible-mode/v1 | qwen-plus | text-embedding-v3 |
+| 智谱 GLM | open.bigmodel.cn/api/paas/v4 | glm-4-flash | embedding-2 |
+| Moonshot Kimi | api.moonshot.cn/v1 | moonshot-v1-8k | （无向量接口）|
+| 硅基流动 | api.siliconflow.cn/v1 | Qwen/Qwen2.5-7B-Instruct | BAAI/bge-m3 |
+| Ollama 本地 | localhost:11434/v1 | qwen2.5 | nomic-embed-text |
+| 自定义 | 手填 | 手填 | 手填 |
+
+**拉取模型**：填好 URL 和 Key 后点 Base URL 行尾的「拉取模型」，会自动请求 `GET /models` 把该账号可用模型填进「分类模型 / 向量模型」下拉框（也可继续手输）。只配了分类模型没有向量模型时，语义搜索不可用，其余功能正常。
 
 **优先级**：界面设置（settings.json）> 环境变量 / `.env` > 内置默认值。界面是最近一次显式操作，当场生效；想用环境变量锁定配置，清空界面设置即可。
 
@@ -169,7 +187,8 @@ clipboard_items(
   source_app,              -- 来源应用（前台窗口标题）
   created_at,              -- 'YYYY-MM-DD HH:MM:SS'
   is_pinned, pinned_at,    -- 置顶状态与时间
-  category                 -- AI 分类标签（未配置 AI 时为 NULL）
+  category,                -- AI 分类标签（未配置 AI 时为 NULL）
+  title                    -- 用户命名（编辑窗设置）
 )
 
 -- clip_vectors 表：item_id 对应 clipboard_items.id，仅文本有条目
@@ -201,7 +220,7 @@ pyinstaller packaging.spec
 
 ```powershell
 pip install -e ".[dev]"
-pytest                        # 65 个用例，无需网络；GUI 用例需要桌面环境
+pytest                        # 77 个用例，无需网络；GUI 用例需要桌面环境
 ruff check .                  # 代码规范检查
 ```
 

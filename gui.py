@@ -24,10 +24,11 @@ from datetime import datetime
 
 try:
     import tkinter as tk
-    from tkinter import messagebox
+    from tkinter import messagebox, ttk
 except ImportError:  # 非 Windows / 精简 Python 环境
     tk = None  # type: ignore[assignment]
     messagebox = None  # type: ignore[assignment]
+    ttk = None  # type: ignore[assignment]
 
 import ai_client
 import clipwriter
@@ -327,7 +328,7 @@ class ClipVaultGUI:
         """加载数据并渲染；数据没变（指纹一致）就跳过重绘。"""
         self.items = self._load_items()
         fingerprint = "|".join(
-            f"{r['id']}:{r['is_pinned']}:{r['category'] or ''}:{r['content_type']}"
+            f"{r['id']}:{r['is_pinned']}:{r['category'] or ''}:{r['content_type']}:{r.get('title') or ''}"
             for r in self.items
         )
         if fingerprint == self._fingerprint:
@@ -368,13 +369,14 @@ class ClipVaultGUI:
         self.count_var.set(f"{len(self.items)} 条")
 
     def _card_height(self, item: dict, width: int) -> int:
-        """估算卡片高度：图片卡固定，文本卡按行数估算。"""
+        """估算卡片高度：图片卡固定，文本卡按行数估算；有名称行另加一行。"""
+        extra = 22 if item.get("title") else 0
         if item["content_type"] == "image":
-            return THUMB_SIZE + META_HEIGHT + 16
+            return THUMB_SIZE + META_HEIGHT + 16 + extra
         text = item.get("text_content") or ""
         chars_per_line = max(20, width // 13)  # 中文约 13px/字
         lines = min(6, max(1, (len(text) + chars_per_line - 1) // chars_per_line))
-        return lines * 22 + META_HEIGHT + 16
+        return lines * 22 + META_HEIGHT + 16 + extra
 
     def _draw_card(self, item: dict, x: int, y: int, w: int, h: int) -> None:
         """画单张卡片（背景/内容/元信息/悬停按钮）。"""
@@ -413,15 +415,31 @@ class ClipVaultGUI:
 
         meta_y = y + h - META_HEIGHT - 4
 
+        # —— 名称行（用户在编辑窗命名后显示，主题色加粗） ——
+        title = item.get("title")
+        content_y = y + 8
+        if title:
+            self.canvas.create_text(
+                x + 12,
+                content_y,
+                text=title,
+                fill=C_ACCENT,
+                font=("Microsoft YaHei UI", 11, "bold"),
+                width=w - 24,
+                anchor=tk.NW,
+                tags=("card", f"card-{item['id']}"),
+            )
+            content_y += 22
+
         # —— 内容区 ——
         if item["content_type"] == "image":
-            self._draw_thumb(item, x + 10, y + 8, THUMB_SIZE)
+            self._draw_thumb(item, x + 10, content_y, THUMB_SIZE)
         else:
             text = item.get("text_content") or ""
             preview = text[:TEXT_PREVIEW_CHARS] + ("…" if len(text) > TEXT_PREVIEW_CHARS else "")
             self.canvas.create_text(
                 x + 12,
-                y + 8,
+                content_y,
                 text=preview,
                 fill=C_TEXT,
                 font=("Microsoft YaHei UI", 11),
@@ -515,11 +533,12 @@ class ClipVaultGUI:
             )
 
     def _draw_action_buttons(self, item: dict, card_x: int, card_y: int, card_w: int) -> None:
-        """在悬停卡片右上角画「置顶 / 删除」按钮。"""
-        btn_w, btn_h = 62, BTN_HEIGHT
+        """在悬停卡片右上角画「置顶 / 编辑 / 删除」按钮。"""
+        btn_w, btn_h = 52, BTN_HEIGHT
         gap = 6
-        x1 = card_x + card_w - btn_w * 2 - gap - 8
-        x2 = card_x + card_w - btn_w - 8
+        x1 = card_x + card_w - btn_w * 3 - gap * 2 - 8
+        x2 = x1 + btn_w + gap
+        x3 = x2 + btn_w + gap
         y = card_y + 8
 
         pinned = bool(item["is_pinned"])
@@ -527,43 +546,33 @@ class ClipVaultGUI:
         del_pending = self.pending_delete_id == item["id"]
         del_text = "确认删除" if del_pending else "删除"
 
-        # 置顶按钮
-        self.canvas.create_rectangle(
-            x1,
-            y,
-            x1 + btn_w,
-            y + btn_h,
-            fill=C_ACCENT,
-            outline=C_ACCENT,
-            tags=("action", f"pin-{item['id']}"),
-        )
-        self.canvas.create_text(
-            x1 + btn_w // 2,
-            y + btn_h // 2,
-            text=pin_text,
-            fill="#ffffff",
-            font=("Microsoft YaHei UI", 9),
-            tags=("action", f"pin-{item['id']}"),
-        )
-        # 删除按钮（确认态变红）
-        del_bg = C_DANGER if del_pending else C_CARD
-        del_fg = "#ffffff" if del_pending else C_TEXT
-        self.canvas.create_rectangle(
-            x2,
-            y,
-            x2 + btn_w,
-            y + btn_h,
-            fill=del_bg,
-            outline=C_DANGER,
-            tags=("action", f"del-{item['id']}"),
-        )
-        self.canvas.create_text(
-            x2 + btn_w // 2,
-            y + btn_h // 2,
-            text=del_text,
-            fill=del_fg,
-            font=("Microsoft YaHei UI", 9),
-            tags=("action", f"del-{item['id']}"),
+        def draw_btn(bx: int, tag: str, text: str, bg: str, fg: str) -> None:
+            self.canvas.create_rectangle(
+                bx,
+                y,
+                bx + btn_w,
+                y + btn_h,
+                fill=bg,
+                outline=bg,
+                tags=("action", f"{tag}-{item['id']}"),
+            )
+            self.canvas.create_text(
+                bx + btn_w // 2,
+                y + btn_h // 2,
+                text=text,
+                fill=fg,
+                font=("Microsoft YaHei UI", 9),
+                tags=("action", f"{tag}-{item['id']}"),
+            )
+
+        draw_btn(x1, "pin", pin_text, C_ACCENT, "#ffffff")
+        draw_btn(x2, "edit", "编辑", C_CARD, C_TEXT)
+        draw_btn(
+            x3,
+            "del",
+            del_text,
+            C_DANGER if del_pending else C_CARD,
+            "#ffffff" if del_pending else C_TEXT,
         )
 
     # ------------------------------------------------------------------
@@ -571,20 +580,23 @@ class ClipVaultGUI:
     # ------------------------------------------------------------------
 
     def _hit_test(self, event) -> tuple[str | None, int | None]:
-        """把画布坐标上的点击解析成 ('action:pin'|'action:del'|'card', item_id)。"""
+        """把画布坐标上的点击解析成 ('action:pin'|'action:edit'|'action:del'|'card', item_id)。"""
         x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
         # 先查悬停按钮（小区域优先）
         for item_id, (cx, cy, cw, ch) in self._card_rects.items():
             if not (cx <= x <= cx + cw and cy <= y <= cy + ch):
                 continue
-            btn_w, btn_h, gap = 62, BTN_HEIGHT, 6
-            bx1 = cx + cw - btn_w * 2 - gap - 8
-            bx2 = cx + cw - btn_w - 8
+            btn_w, btn_h, gap = 52, BTN_HEIGHT, 6
+            bx1 = cx + cw - btn_w * 3 - gap * 2 - 8
+            bx2 = bx1 + btn_w + gap
+            bx3 = bx2 + btn_w + gap
             by = cy + 8
             if self.hovered_id == item_id:
                 if bx1 <= x <= bx1 + btn_w and by <= y <= by + btn_h:
                     return ("action:pin", item_id)
                 if bx2 <= x <= bx2 + btn_w and by <= y <= by + btn_h:
+                    return ("action:edit", item_id)
+                if bx3 <= x <= bx3 + btn_w and by <= y <= by + btn_h:
                     return ("action:del", item_id)
             return ("card", item_id)
         return (None, None)
@@ -593,6 +605,8 @@ class ClipVaultGUI:
         kind, item_id = self._hit_test(event)
         if kind == "action:pin" and item_id is not None:
             self._toggle_pin(item_id)
+        elif kind == "action:edit" and item_id is not None:
+            self.open_editor(item_id)
         elif kind == "action:del" and item_id is not None:
             self._handle_delete_click(item_id)
         elif kind == "card" and item_id is not None:
@@ -601,7 +615,7 @@ class ClipVaultGUI:
     def _on_motion(self, event) -> None:
         """悬停高亮：只在其变化时重绘，避免拖动鼠标疯狂重画。"""
         kind, item_id = self._hit_test(event)
-        new_hover = item_id if kind in ("card", "action:pin", "action:del") else None
+        new_hover = item_id if kind in ("card", "action:pin", "action:edit", "action:del") else None
         if new_hover != self.hovered_id:
             self.hovered_id = new_hover
             self._render()
@@ -724,14 +738,18 @@ class ClipVaultGUI:
     # AI 设置窗口（界面直接配置 API，保存到 settings.json 即时生效）
     # ------------------------------------------------------------------
 
-    #: 设置项：（标签, 配置键, 控件类型）
+    #: 普通文本设置项：（标签, 配置键, 控件类型）
     _SETTINGS_FIELDS: tuple[tuple[str, str, str], ...] = (
         ("API Key", "CLIPVAULT_AI_API_KEY", "secret"),
         ("接口地址 Base URL", "CLIPVAULT_AI_BASE_URL", "text"),
-        ("分类模型", "CLIPVAULT_AI_CHAT_MODEL", "text"),
-        ("向量模型", "CLIPVAULT_AI_EMBED_MODEL", "text"),
         ("候选分类（逗号分隔）", "CLIPVAULT_AI_CATEGORIES", "text"),
         ("请求超时（秒）", "CLIPVAULT_AI_TIMEOUT", "text"),
+    )
+
+    #: 模型设置项：下拉框，选项由「拉取模型」填充
+    _MODEL_FIELDS: tuple[tuple[str, str], ...] = (
+        ("分类模型", "CLIPVAULT_AI_CHAT_MODEL"),
+        ("向量模型", "CLIPVAULT_AI_EMBED_MODEL"),
     )
 
     #: 设置项的默认展示值（与 ai_client 的常量保持一致）
@@ -743,6 +761,23 @@ class ClipVaultGUI:
         "CLIPVAULT_AI_CATEGORIES": "、".join(ai_client.DEFAULT_CATEGORIES),
         "CLIPVAULT_AI_TIMEOUT": "10",
     }
+
+    def _make_dark_combobox_style(self) -> None:
+        """给 ttk.Combobox 配一套深色样式（clam 主题支持自定义 fieldbackground）。"""
+        try:
+            style = ttk.Style()
+            style.theme_use("clam")
+            style.configure(
+                "Dark.TCombobox",
+                fieldbackground=C_CARD,
+                background=C_CARD,
+                foreground=C_TEXT,
+                arrowcolor=C_TEXT,
+                borderwidth=1,
+            )
+            style.map("Dark.TCombobox", fieldbackground=[("readonly", C_CARD)])
+        except Exception:
+            pass  # 样式失败不碍事，用默认外观
 
     def open_settings(self) -> None:
         """打开 AI 设置窗口（模态）；已打开则提到最前。"""
@@ -757,9 +792,11 @@ class ClipVaultGUI:
         win.configure(bg=C_BG)
         win.transient(self.root)
         win.resizable(False, False)
+        self._make_dark_combobox_style()
 
         entries: dict[str, tk.StringVar] = {}
         show_key = tk.BooleanVar(value=False)
+        model_boxes: dict[str, ttk.Combobox] = {}
 
         # —— 顶部说明 ——
         tk.Label(
@@ -789,8 +826,35 @@ class ClipVaultGUI:
             font=("Microsoft YaHei UI", 10),
         ).grid(row=1, column=0, columnspan=3, padx=14, pady=4, sticky=tk.W)
 
-        # —— 各字段 ——
-        row = 2
+        # —— 厂商预设（选中自动填 Base URL 与默认模型） ——
+        tk.Label(win, text="厂商预设", bg=C_BG, fg=C_DIM, font=("Microsoft YaHei UI", 10)).grid(
+            row=2, column=0, padx=(14, 6), pady=4, sticky=tk.W
+        )
+        current_base = config.get_setting("CLIPVAULT_AI_BASE_URL", "").strip().rstrip("/")
+        provider_names = list(ai_client.PROVIDERS.keys())
+        current_provider = "自定义"
+        for name, preset in ai_client.PROVIDERS.items():
+            if preset["base"] and preset["base"].rstrip("/") == current_base:
+                current_provider = name
+                break
+        provider_var = tk.StringVar(value=current_provider)
+        provider_box = ttk.Combobox(
+            win,
+            textvariable=provider_var,
+            values=provider_names,
+            width=40,
+            state="readonly",
+            style="Dark.TCombobox",
+            font=("Microsoft YaHei UI", 10),
+        )
+        provider_box.grid(row=2, column=1, padx=4, pady=4, sticky=tk.W)
+        provider_box.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self._settings_apply_provider(provider_var, entries),
+        )
+
+        # —— 普通字段 ——
+        row = 3
         for label, key, kind in self._SETTINGS_FIELDS:
             tk.Label(win, text=label, bg=C_BG, fg=C_DIM, font=("Microsoft YaHei UI", 10)).grid(
                 row=row, column=0, padx=(14, 6), pady=4, sticky=tk.W
@@ -813,7 +877,6 @@ class ClipVaultGUI:
             )
             entry.grid(row=row, column=1, padx=4, pady=4)
             if kind == "secret":
-                # Key 显示 / 隐藏切换
                 tk.Checkbutton(
                     win,
                     text="显示",
@@ -826,19 +889,55 @@ class ClipVaultGUI:
                     activeforeground=C_TEXT,
                     font=("Microsoft YaHei UI", 9),
                 ).grid(row=row, column=2, padx=(0, 14), sticky=tk.W)
+            if key == "CLIPVAULT_AI_BASE_URL":
+                # Base URL 行尾放「拉取模型」按钮
+                fetch_btn = tk.Button(
+                    win,
+                    text="拉取模型",
+                    command=lambda: self._settings_fetch_models(win, entries, provider_var),
+                    bg=C_ACCENT,
+                    fg="#ffffff",
+                    activebackground=C_CARD_HOVER,
+                    activeforeground=C_TEXT,
+                    relief=tk.FLAT,
+                    font=("Microsoft YaHei UI", 9),
+                    padx=8,
+                    pady=1,
+                    cursor="hand2",
+                )
+                fetch_btn.grid(row=row, column=2, padx=(0, 14), sticky=tk.W)
+            row += 1
+
+        # —— 模型字段（下拉，选项来自拉取结果；也可手输） ——
+        model_boxes: dict[str, ttk.Combobox] = {}
+        for label, key in self._MODEL_FIELDS:
+            tk.Label(win, text=label, bg=C_BG, fg=C_DIM, font=("Microsoft YaHei UI", 10)).grid(
+                row=row, column=0, padx=(14, 6), pady=4, sticky=tk.W
+            )
+            var = tk.StringVar(value=config.get_setting(key, self._SETTINGS_DEFAULTS.get(key, "")))
+            entries[key] = var
+            box = ttk.Combobox(
+                win,
+                textvariable=var,
+                width=42,
+                style="Dark.TCombobox",
+                font=("Microsoft YaHei UI", 10),
+            )
+            box.grid(row=row, column=1, padx=4, pady=4)
+            model_boxes[key] = box
             row += 1
 
         # —— 按钮行 ——
         btn_row = tk.Frame(win, bg=C_BG)
         btn_row.grid(row=row, column=0, columnspan=3, padx=14, pady=(12, 14), sticky=tk.E)
 
-        def make_btn(text, cmd, danger=False):
+        def make_btn(text, cmd, danger=False, accent=False):
             return tk.Button(
                 btn_row,
                 text=text,
                 command=cmd,
-                bg=C_DANGER if danger else C_CARD,
-                fg="#ffffff" if danger else C_TEXT,
+                bg=C_DANGER if danger else (C_ACCENT if accent else C_CARD),
+                fg="#ffffff" if (danger or accent) else C_TEXT,
                 activebackground=C_CARD_HOVER,
                 activeforeground=C_TEXT,
                 relief=tk.FLAT,
@@ -854,15 +953,70 @@ class ClipVaultGUI:
         make_btn(
             "恢复默认", lambda: self._settings_reset(win, entries, enabled_var), danger=True
         ).pack(side=tk.LEFT, padx=(0, 8))
-        make_btn("保存", lambda: self._settings_save(win, entries, enabled_var)).pack(
+        make_btn("保存", lambda: self._settings_save(win, entries, enabled_var), accent=True).pack(
             side=tk.LEFT, padx=(0, 8)
         )
         make_btn("完成", self._close_settings).pack(side=tk.LEFT)
 
+        self._settings_entries = entries
+        self._settings_model_boxes = model_boxes
+        self._settings_enabled = enabled_var
         self._settings_win = win
         win.protocol("WM_DELETE_WINDOW", self._close_settings)
         win.grab_set()  # 模态：设置窗口打开期间不操作主窗口
         win.focus_set()
+
+    def _settings_apply_provider(
+        self, provider_var: tk.StringVar, entries: dict[str, tk.StringVar]
+    ) -> None:
+        """选中厂商预设：自动填 Base URL 与默认模型（自定义不清空）。"""
+        preset = ai_client.PROVIDERS.get(provider_var.get())
+        if not preset:
+            return
+        if preset["base"]:
+            entries["CLIPVAULT_AI_BASE_URL"].set(preset["base"])
+        if preset["chat"]:
+            entries["CLIPVAULT_AI_CHAT_MODEL"].set(preset["chat"])
+        if preset["embed"]:
+            entries["CLIPVAULT_AI_EMBED_MODEL"].set(preset["embed"])
+        self._toast(f"已应用「{provider_var.get()}」预设，填好 Key 后可点「拉取模型」")
+
+    def _settings_fetch_models(
+        self, win, entries: dict[str, tk.StringVar], provider_var: tk.StringVar
+    ) -> None:
+        """后台拉取模型列表（不阻塞 UI），回填到两个模型下拉框。"""
+        # 先把当前界面值存盘，ai_client 才能拿到最新的 URL/Key
+        enabled_var = getattr(self, "_settings_enabled", None)
+        if enabled_var is None:
+            enabled_var = tk.BooleanVar(
+                value=config.get_setting("CLIPVAULT_AI_ENABLED", "1").lower()
+                not in ("0", "false", "no")
+            )
+        self._settings_save(win, entries, enabled_var)
+        if not config.get_setting("CLIPVAULT_AI_BASE_URL", "").strip():
+            messagebox.showwarning("拉取模型", "请先填写接口地址 Base URL。", parent=win)
+            return
+        self._toast("正在拉取模型列表…")
+
+        def _run():
+            models = ai_client.fetch_models()
+            self.root.after(0, self._fill_model_boxes, models)
+
+        import threading
+
+        threading.Thread(target=_run, name="clipvault-fetch-models", daemon=True).start()
+
+    def _fill_model_boxes(self, models: list[str]) -> None:
+        """把拉取到的模型列表填进模型下拉框（保留当前已选值）。"""
+        if getattr(self, "_settings_win", None) is None:
+            return
+        boxes = getattr(self, "_settings_model_boxes", {})
+        if models:
+            for box in boxes.values():
+                box.configure(values=models)
+            self._toast(f"✅ 拉到 {len(models)} 个模型，已在下方下拉框中选择")
+        else:
+            self._toast("未拉到模型：请检查 URL / Key / 网络", error=True)
 
     def _settings_collect(
         self, entries: dict[str, tk.StringVar], enabled_var: tk.BooleanVar
@@ -941,6 +1095,154 @@ class ClipVaultGUI:
             pass
         win.destroy()
         self._settings_win = None
+
+    # ------------------------------------------------------------------
+    # 条目编辑：改内容 + 命名
+    # ------------------------------------------------------------------
+
+    def open_editor(self, item_id: int) -> None:
+        """打开条目编辑窗口：文本条目可改内容+命名，图片条目仅支持命名。"""
+        item = storage.get_item(item_id)
+        if item is None:
+            return
+        existing = getattr(self, "_editor_win", None)
+        if existing is not None:
+            existing.destroy()
+            self._editor_win = None
+
+        win = tk.Toplevel(self.root)
+        win.title("编辑条目")
+        win.configure(bg=C_BG)
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        is_text = item["content_type"] == "text"
+        tk.Label(
+            win,
+            text=(
+                "修改文本内容并给它起个名字；保存后立即生效。"
+                if is_text
+                else "图片条目不支持改内容，可以给它起个名字。"
+            ),
+            bg=C_BG,
+            fg=C_DIM,
+            font=("Microsoft YaHei UI", 9),
+        ).grid(row=0, column=0, columnspan=2, padx=14, pady=(14, 8), sticky=tk.W)
+
+        # —— 名称 ——
+        tk.Label(win, text="名称", bg=C_BG, fg=C_DIM, font=("Microsoft YaHei UI", 10)).grid(
+            row=1, column=0, padx=(14, 6), pady=4, sticky=tk.NW
+        )
+        title_var = tk.StringVar(value=item.get("title") or "")
+        tk.Entry(
+            win,
+            textvariable=title_var,
+            width=46,
+            bg=C_CARD,
+            fg=C_TEXT,
+            insertbackground=C_TEXT,
+            highlightbackground=C_BORDER,
+            highlightcolor=C_ACCENT,
+            highlightthickness=1,
+            relief=tk.FLAT,
+            font=("Microsoft YaHei UI", 10),
+        ).grid(row=1, column=1, padx=(0, 14), pady=4)
+
+        # —— 内容（仅文本条目可编辑） ——
+        content_box = None
+        if is_text:
+            tk.Label(win, text="内容", bg=C_BG, fg=C_DIM, font=("Microsoft YaHei UI", 10)).grid(
+                row=2, column=0, padx=(14, 6), pady=4, sticky=tk.NW
+            )
+            content_box = tk.Text(
+                win,
+                width=46,
+                height=10,
+                bg=C_CARD,
+                fg=C_TEXT,
+                insertbackground=C_TEXT,
+                highlightbackground=C_BORDER,
+                highlightcolor=C_ACCENT,
+                highlightthickness=1,
+                relief=tk.FLAT,
+                font=("Microsoft YaHei UI", 10),
+                wrap=tk.WORD,
+            )
+            content_box.insert("1.0", item.get("text_content") or "")
+            content_box.grid(row=2, column=1, padx=(0, 14), pady=4)
+
+        # —— 按钮 ——
+        btn_row = tk.Frame(win, bg=C_BG)
+        btn_row.grid(row=3, column=0, columnspan=2, padx=14, pady=(12, 14), sticky=tk.E)
+
+        def on_save():
+            try:
+                if is_text and content_box is not None:
+                    new_text = content_box.get("1.0", tk.END).strip()
+                    if new_text and new_text != (item.get("text_content") or "").strip():
+                        storage.update_item_content(item_id, new_text)
+                new_title = title_var.get().strip()
+                if new_title != (item.get("title") or ""):
+                    storage.update_item_title(item_id, new_title)
+            except storage.ContentConflictError as exc:
+                messagebox.showwarning("无法保存", str(exc), parent=win)
+                return
+            except ValueError as exc:
+                messagebox.showwarning("无法保存", str(exc), parent=win)
+                return
+            # 内容/名称可能变化：强制刷新列表
+            self._fingerprint = None
+            self.hovered_id = None
+            self._load_and_render()
+            self._toast("✅ 已保存修改")
+            self._close_editor()
+
+        tk.Button(
+            btn_row,
+            text="保存",
+            command=on_save,
+            bg=C_ACCENT,
+            fg="#ffffff",
+            activebackground=C_CARD_HOVER,
+            activeforeground=C_TEXT,
+            relief=tk.FLAT,
+            font=("Microsoft YaHei UI", 10),
+            padx=14,
+            pady=3,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(
+            btn_row,
+            text="取消",
+            command=self._close_editor,
+            bg=C_CARD,
+            fg=C_TEXT,
+            activebackground=C_CARD_HOVER,
+            activeforeground=C_TEXT,
+            relief=tk.FLAT,
+            font=("Microsoft YaHei UI", 10),
+            padx=14,
+            pady=3,
+            cursor="hand2",
+        ).pack(side=tk.LEFT)
+
+        self._editor_win = win
+        self._editor_item_id = item_id
+        win.protocol("WM_DELETE_WINDOW", self._close_editor)
+        win.grab_set()
+        win.focus_set()
+
+    def _close_editor(self) -> None:
+        """关闭编辑窗口（释放模态）。"""
+        win = getattr(self, "_editor_win", None)
+        if win is None:
+            return
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        win.destroy()
+        self._editor_win = None
 
     def _on_search_changed(self, *_args) -> None:
         """搜索防抖：停止输入 300ms 后才查询。"""

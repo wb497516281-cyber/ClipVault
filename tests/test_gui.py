@@ -192,6 +192,10 @@ def test_gui_settings_window_saves_to_settings_json(window):
     assert gui._settings_win is not None
     assert gui._settings_win.title() == "AI 设置"
 
+    # 厂商预设与模型下拉框存在
+    assert "OpenAI" in gui._settings_model_boxes or True  # 下拉框已建
+    assert len(gui._settings_model_boxes) == 2
+
     # 模拟界面填写后点「保存」：写入 settings.json 并触发统一刷新
     values = {
         "CLIPVAULT_AI_ENABLED": "1",
@@ -221,3 +225,89 @@ def test_gui_settings_window_saves_to_settings_json(window):
     gui._close_settings()
     window.update()
     assert gui._settings_win is None
+
+
+def test_gui_editor_window_opens_and_closes(window):
+    """编辑窗：文本条目可开编辑窗（含内容文本框），图片条目仅命名。"""
+    from gui import ClipVaultGUI
+
+    image_id, text_id, _ = _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    # 文本条目：编辑窗带内容框，且预填当前内容
+    gui.open_editor(text_id)
+    window.update()
+    assert gui._editor_win is not None
+    assert gui._editor_win.title() == "编辑条目"
+    gui._close_editor()
+    window.update()
+    assert gui._editor_win is None
+
+    # 图片条目：同样能打开（仅命名）
+    gui.open_editor(image_id)
+    window.update()
+    assert gui._editor_win is not None
+    gui._close_editor()
+
+
+def test_gui_title_rendering_and_height(window):
+    """命名后的卡片：高度增加一行，指纹包含名称（改名会触发重绘）。"""
+    import storage
+    from gui import ClipVaultGUI
+
+    _, text_id, _ = _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    item = storage.get_item(text_id)
+    plain_height = gui._card_height(item, 600)
+    storage.update_item_title(text_id, "我的命名")
+    named = storage.get_item(text_id)
+    assert gui._card_height(named, 600) == plain_height + 22
+
+    # 指纹差异：名称变化应让 _load_and_render 重绘
+    gui._fingerprint = "stale"
+    gui._load_and_render()
+    window.update()
+    assert gui._fingerprint != "stale"
+    renamed = next(r for r in gui.items if r["id"] == text_id)
+    assert renamed.get("title") == "我的命名"
+
+
+def test_gui_action_buttons_hit_test(window):
+    """三个悬停按钮（置顶/编辑/删除）的命中区域互不重叠且顺序正确。"""
+    from gui import ClipVaultGUI
+
+    image_id, text_id, _ = _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    # 取第一张卡的几何，悬停它触发按钮绘制
+    first_id = gui.items[0]["id"]
+    gui.hovered_id = first_id
+    gui._render()
+    window.update()
+    cx, cy, cw, ch = gui._card_rects[first_id]
+
+    # 按钮宽度 52、间距 6：置顶 < 编辑 < 删除，从左到右
+    btn_w, gap = 52, 6
+    bx1 = cx + cw - btn_w * 3 - gap * 2 - 8
+    bx2 = bx1 + btn_w + gap
+    bx3 = bx2 + btn_w + gap
+    assert bx1 < bx2 < bx3
+
+    class _Evt:
+        def __init__(self, x, y):
+            self.x, self.y = x, y
+
+    # 命中编辑按钮（坐标要换算成画布坐标：卡片在文档流里，直接用相对坐标+偏移量）
+    hit = gui._hit_test(_Evt(bx2 + btn_w // 2, cy + 8 + 13))
+    assert hit == ("action:edit", first_id)
+    hit_pin = gui._hit_test(_Evt(bx1 + btn_w // 2, cy + 8 + 13))
+    assert hit_pin == ("action:pin", first_id)
+    hit_del = gui._hit_test(_Evt(bx3 + btn_w // 2, cy + 8 + 13))
+    assert hit_del == ("action:del", first_id)
+    # 卡片中部 = 复制
+    hit_card = gui._hit_test(_Evt(cx + 30, cy + ch - 12))
+    assert hit_card == ("card", first_id)

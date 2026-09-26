@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import struct
 from collections.abc import Sequence
@@ -92,6 +93,8 @@ def _ensure_optional_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE clipboard_items ADD COLUMN pinned_at TEXT")
     if "category" not in columns:
         conn.execute("ALTER TABLE clipboard_items ADD COLUMN category TEXT")
+    if "title" not in columns:
+        conn.execute("ALTER TABLE clipboard_items ADD COLUMN title TEXT")
 
 
 # ---------------------------------------------------------------------------
@@ -380,3 +383,43 @@ def delete_item(item_id: int) -> list[str]:
         conn.execute("DELETE FROM clip_vectors WHERE item_id = ?", (item_id,))
         conn.commit()
     return paths
+
+
+def update_item_title(item_id: int, title: str) -> None:
+    """给条目命名（title）；传空串表示清除名称。"""
+    with closing(get_connection()) as conn:
+        conn.execute(
+            "UPDATE clipboard_items SET title = ? WHERE id = ?",
+            (title.strip() or None, item_id),
+        )
+        conn.commit()
+
+
+class ContentConflictError(Exception):
+    """修改后的内容与另一条条目重复（内容哈希冲突）。"""
+
+
+def update_item_content(item_id: int, new_text: str) -> None:
+    """修改文本条目的内容（内容哈希同步重算）。
+
+    与其它条目内容撞车时抛 ContentConflictError，不做修改。
+    """
+    new_text = new_text.strip()
+    if not new_text:
+        raise ValueError("内容不能为空")
+    digest = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
+    with closing(get_connection()) as conn:
+        row = conn.execute(
+            "SELECT id FROM clipboard_items WHERE content_hash = ? AND id != ?",
+            (digest, item_id),
+        ).fetchone()
+        if row is not None:
+            raise ContentConflictError("修改后的内容与另一条记录重复")
+        conn.execute(
+            "UPDATE clipboard_items SET text_content = ?, content_hash = ? WHERE id = ?",
+            (new_text, digest, item_id),
+        )
+        conn.commit()
+        # 内容变了，旧向量失效：一并清掉，等 AI 队列重建
+        conn.execute("DELETE FROM clip_vectors WHERE item_id = ?", (item_id,))
+        conn.commit()

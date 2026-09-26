@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -247,3 +248,60 @@ def test_find_by_ids_preserves_lookup():
     row_map = storage.find_by_ids([b, a])
     assert set(row_map.keys()) == {a, b}
     assert row_map[a]["content_hash"] == "b1"
+
+
+# ---------------------------------------------------------------------------
+# 编辑：命名 / 改内容（GUI 编辑窗依赖）
+# ---------------------------------------------------------------------------
+
+
+def test_update_item_title_roundtrip():
+    item_id = storage.insert_item("text", content_hash="t1", text_content="内容")
+    storage.update_item_title(item_id, "  重要片段  ")
+    assert storage.get_item(item_id)["title"] == "重要片段"
+    # 空串 = 清除名称
+    storage.update_item_title(item_id, "")
+    assert storage.get_item(item_id)["title"] is None
+
+
+def test_update_item_content_recomputes_hash():
+    item_id = storage.insert_item("text", content_hash="c1", text_content="旧内容")
+    storage.update_item_content(item_id, "新内容")
+    row = storage.get_item(item_id)
+    assert row["text_content"] == "新内容"
+    assert row["content_hash"] == hashlib.sha256("新内容".encode()).hexdigest()
+    # 按新内容能搜到
+    assert len(storage.list_items(q="新内容")) == 1
+
+
+def test_update_item_content_conflict():
+    """改成的内容与另一条重复时拒绝修改。"""
+    a = storage.insert_item(
+        "text",
+        content_hash=hashlib.sha256("甲".encode()).hexdigest(),
+        text_content="甲",
+    )
+    b = storage.insert_item(
+        "text",
+        content_hash=hashlib.sha256("乙".encode()).hexdigest(),
+        text_content="乙",
+    )
+    with pytest.raises(storage.ContentConflictError):
+        storage.update_item_content(b, "甲")
+    # 原内容保持不变
+    assert storage.get_item(b)["text_content"] == "乙"
+    assert storage.find_by_hash(hashlib.sha256("甲".encode()).hexdigest())["id"] == a
+
+
+def test_update_item_content_rejects_empty():
+    item_id = storage.insert_item("text", content_hash="e1", text_content="内容")
+    with pytest.raises(ValueError):
+        storage.update_item_content(item_id, "   ")
+
+
+def test_update_item_content_clears_vector():
+    """内容变了旧向量失效：应被清掉（等 AI 队列重建）。"""
+    item_id = storage.insert_item("text", content_hash="f1", text_content="旧")
+    storage.upsert_vector(item_id, [1.0], "m")
+    storage.update_item_content(item_id, "新")
+    assert storage.load_vectors() == []

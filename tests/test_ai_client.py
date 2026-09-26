@@ -86,6 +86,52 @@ def test_network_failure_returns_none(fake_key, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 厂商预设与模型拉取
+# ---------------------------------------------------------------------------
+
+
+def test_providers_presets_are_complete():
+    """每个厂商预设都必须带 base/chat/embed 三个键，base 是 http(s) 地址。"""
+    assert "自定义" in ai_client.PROVIDERS
+    for name, preset in ai_client.PROVIDERS.items():
+        assert set(preset.keys()) == {"base", "chat", "embed"}, name
+        if preset["base"]:
+            assert preset["base"].startswith(("http://", "https://")), name
+    for name in ("OpenAI", "DeepSeek", "通义千问", "智谱 GLM", "Moonshot Kimi", "Ollama 本地"):
+        assert name in ai_client.PROVIDERS, name
+
+
+def test_fetch_models_success(fake_key, monkeypatch):
+    """拉取成功：返回排序去重的模型 ID 列表。"""
+    monkeypatch.setattr(
+        ai_client,
+        "_get_json",
+        lambda path: {
+            "data": [
+                {"id": "gpt-4o-mini"},
+                {"id": "text-embedding-3-small"},
+                {"id": "gpt-4o-mini"},  # 重复应去重
+            ]
+        },
+    )
+    assert ai_client.fetch_models() == ["gpt-4o-mini", "text-embedding-3-small"]
+
+
+def test_fetch_models_failure_returns_empty(fake_key, monkeypatch):
+    """拉取失败（网络/Key 错/接口不兼容）返回空列表，不抛异常。"""
+    monkeypatch.setattr(ai_client, "_get_json", lambda path: None)
+    assert ai_client.fetch_models() == []
+
+
+def test_fetch_models_malformed_payload(fake_key, monkeypatch):
+    """接口返回结构不对时返回空列表。"""
+    monkeypatch.setattr(ai_client, "_get_json", lambda path: {"unexpected": True})
+    assert ai_client.fetch_models() == []
+    monkeypatch.setattr(ai_client, "_get_json", lambda path: {"data": "not-a-list"})
+    assert ai_client.fetch_models() == []
+
+
+# ---------------------------------------------------------------------------
 # 分类解析
 # ---------------------------------------------------------------------------
 
