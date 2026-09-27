@@ -354,6 +354,7 @@ def test_gui_editor_save_conflict_keeps_window(window, monkeypatch):
 
 
 def test_gui_action_buttons_hit_test(window):
+    """卡片悬停按钮 4 个：分组 < 置顶 < 编辑 < 删除，命中区域互不重叠。"""
     from gui import ClipVaultGUI
 
     image_id, text_id, _ = _seed()
@@ -367,24 +368,206 @@ def test_gui_action_buttons_hit_test(window):
     window.update()
     cx, cy, cw, ch = gui._card_rects[first_id]
 
-    # 按钮宽度 52、间距 6：置顶 < 编辑 < 删除，从左到右
+    # 按钮宽度 52、间距 6：分组 < 置顶 < 编辑 < 删除，从左到右
     btn_w, gap = 52, 6
-    bx1 = cx + cw - btn_w * 3 - gap * 2 - 8
+    bx1 = cx + cw - btn_w * 4 - gap * 3 - 8
     bx2 = bx1 + btn_w + gap
     bx3 = bx2 + btn_w + gap
-    assert bx1 < bx2 < bx3
+    bx4 = bx3 + btn_w + gap
+    assert bx1 < bx2 < bx3 < bx4
 
     class _Evt:
         def __init__(self, x, y):
             self.x, self.y = x, y
 
-    # 命中编辑按钮（坐标要换算成画布坐标：卡片在文档流里，直接用相对坐标+偏移量）
-    hit = gui._hit_test(_Evt(bx2 + btn_w // 2, cy + 8 + 13))
-    assert hit == ("action:edit", first_id)
-    hit_pin = gui._hit_test(_Evt(bx1 + btn_w // 2, cy + 8 + 13))
-    assert hit_pin == ("action:pin", first_id)
-    hit_del = gui._hit_test(_Evt(bx3 + btn_w // 2, cy + 8 + 13))
+    # 坐标换算成画布坐标：卡片在文档流里，直接用相对坐标+偏移量
+    assert gui._hit_test(_Evt(bx1 + btn_w // 2, cy + 8 + 13)) == ("action:group", first_id)
+    assert gui._hit_test(_Evt(bx2 + btn_w // 2, cy + 8 + 13)) == ("action:pin", first_id)
+    hit_edit = gui._hit_test(_Evt(bx3 + btn_w // 2, cy + 8 + 13))
+    assert hit_edit == ("action:edit", first_id)
+    hit_del = gui._hit_test(_Evt(bx4 + btn_w // 2, cy + 8 + 13))
     assert hit_del == ("action:del", first_id)
     # 卡片中部 = 复制
     hit_card = gui._hit_test(_Evt(cx + 30, cy + ch - 12))
     assert hit_card == ("card", first_id)
+
+
+# ---------------------------------------------------------------------------
+# 分组：左栏筛选 / 卡片分组菜单 / 分组管理 / AI 自动分组
+# ---------------------------------------------------------------------------
+
+
+def test_gui_group_sidebar_and_view_filter(window):
+    """分组栏切换视图：全部 / 未分组 / 具体分组，列表正确过滤。"""
+    import storage
+    from gui import ClipVaultGUI
+
+    image_id, text_id, pinned_id = _seed()
+    group = storage.create_group("工作")
+    storage.add_item_to_group(text_id, group)
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    # 默认「全部」视图
+    assert len(gui.items) == 3
+    # 「未分组」只剩图片 + 置顶文本
+    gui._select_group("ungrouped")
+    window.update()
+    assert {r["id"] for r in gui.items} == {image_id, pinned_id}
+    # 具体分组只剩分进去的那条
+    gui._select_group(group)
+    window.update()
+    assert [r["id"] for r in gui.items] == [text_id]
+    # 回「全部」
+    gui._select_group("all")
+    window.update()
+    assert len(gui.items) == 3
+    # 卡片上带分组名（meta 徽章与指纹用）
+    row = next(r for r in gui.items if r["id"] == text_id)
+    assert row["group_names"] == ["工作"]
+
+
+def test_gui_group_view_with_search(window):
+    """分组视图与关键词搜索叠加：两个条件都生效。"""
+    from gui import ClipVaultGUI
+
+    _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    gui._placeholder_active = False
+    gui.search_var.set("置顶")
+    gui._select_group("ungrouped")
+    window.update()
+    assert [r["id"] for r in gui.items] == [gui.items[0]["id"]]
+    assert gui.items[0]["text_content"] == "置顶条目"
+
+
+def test_gui_group_menu_toggles_membership(window):
+    """分组菜单：打开 -> 勾选加入 -> 取消，落库且指纹触发重绘。"""
+    import storage
+    from gui import ClipVaultGUI
+
+    _, text_id, _ = _seed()
+    group = storage.create_group("工作")
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    class _Evt:
+        x_root, y_root = 100, 100
+
+    gui._open_group_menu(_Evt(), text_id)
+    window.update()
+    assert gui._group_menu_win is not None
+    assert group in gui._group_menu_vars  # 菜单列出了该分组
+
+    gui._toggle_item_group(text_id, group, True)
+    window.update()
+    assert storage.item_group_ids(text_id) == [group]
+    # 分组栏计数即时刷新：「未分组」从 3 变 2
+    assert gui.group_nav_buttons["ungrouped"]["text"] == "未分组（2）"
+
+    gui._toggle_item_group(text_id, group, False)
+    window.update()
+    assert storage.item_group_ids(text_id) == []
+    assert gui.group_nav_buttons["ungrouped"]["text"] == "未分组（3）"
+
+    gui._close_group_menu()
+    window.update()
+    assert gui._group_menu_win is None
+
+
+def test_gui_group_management(window, monkeypatch):
+    """分组管理：新建（切到新组）-> 重名警告 -> 重命名 -> 删除（条目保留）。"""
+    import gui as gui_module
+    import storage
+    from gui import ClipVaultGUI
+
+    _, text_id, _ = _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    warnings: list[tuple] = []
+    answers = iter(["工作", "开发", "新名字"])  # 新建 / 撞名 / 改名
+    monkeypatch.setattr(gui_module.simpledialog, "askstring", lambda *a, **k: next(answers))
+    monkeypatch.setattr(gui_module.messagebox, "showwarning", lambda *a, **k: warnings.append(a))
+
+    gui._new_group_clicked()
+    window.update()
+    group = next(g for g in storage.list_groups() if g["name"] == "工作")
+    assert gui.group_id == group["id"]  # 新建后直接切到该分组视图
+
+    storage.create_group("开发")  # 另一个分组先占住「开发」这个名字
+    gui._rename_group(group["id"])  # 想改成「开发」-> 撞名 -> 警告
+    window.update()
+    assert warnings and "已存在" in str(warnings[0])
+    assert storage.get_group(group["id"])["name"] == "工作"  # 没改成
+
+    gui._rename_group(group["id"])  # 改成「新名字」
+    window.update()
+    assert storage.get_group(group["id"])["name"] == "新名字"
+
+    monkeypatch.setattr(gui_module.messagebox, "askyesno", lambda *a, **k: True)
+    gui._delete_group(group["id"])
+    window.update()
+    assert storage.get_group(group["id"]) is None
+    assert storage.get_item(text_id) is not None  # 条目不受影响
+    assert gui.group_id is None  # 正在看被删的组 -> 退回「全部」
+
+
+def test_gui_auto_group_worker_creates_groups_and_assigns(window, monkeypatch):
+    """AI 自动分组（同步部分）：未分组条目 -> 模型分配 -> 建组 -> 入组。"""
+    import ai_client
+    import storage
+    from gui import ClipVaultGUI
+
+    _, text_id, pinned_id = _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    monkeypatch.setattr(ai_client, "is_configured", lambda: True)
+    monkeypatch.setattr(
+        ai_client, "assign_groups", lambda rows, existing: {i: "AI 新组" for i, _ in rows}
+    )
+    message = gui._run_auto_group()
+    window.update()
+
+    assert "2 条入组" in message, message
+    group = next(g for g in storage.list_groups() if g["name"] == "AI 新组")
+    assert group["count"] == 2
+    assert set(storage.item_group_ids(text_id)) == {group["id"]}
+    assert set(storage.item_group_ids(pinned_id)) == {group["id"]}
+
+
+def test_gui_auto_group_requires_ai(window, monkeypatch):
+    """AI 未配置时点「AI 自动分组」：提示 + 不起后台任务（安全降级）。"""
+    import ai_client
+    from gui import ClipVaultGUI
+
+    _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+    monkeypatch.setattr(ai_client, "is_configured", lambda: False)
+    gui.ai_configured = False
+    gui.start_auto_group()
+    assert getattr(gui, "_auto_group_running", False) is False
+
+
+def test_gui_fingerprint_includes_group_names(window):
+    """分组归属变化应让渲染指纹变化（否则徽章不刷新）。"""
+    import storage
+    from gui import ClipVaultGUI
+
+    _, text_id, _ = _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    row = next(r for r in gui.items if r["id"] == text_id)
+    before = gui._fingerprint
+    group = storage.create_group("工作")
+    storage.add_item_to_group(text_id, group)
+    gui._load_and_render()
+    window.update()
+    assert gui._fingerprint != before  # 分组名进了指纹，触发重绘
+    row = next(r for r in gui.items if r["id"] == text_id)
+    assert row["group_names"] == ["工作"]

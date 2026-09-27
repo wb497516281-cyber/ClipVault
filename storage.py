@@ -7,7 +7,9 @@
   3. content_type 区分 'text' 与 'image'，两类内容共用一张表；
   4. content_hash 为 SHA-256 内容哈希，库内加 UNIQUE 约束兜底去重；
   5. clip_vectors 表里的 BLOB 是「文本语义向量」(float32)，不是图片数据，
-     图片仍然只存路径 —— 两者互不影响。
+     图片仍然只存路径 —— 两者互不影响；
+  6. 分组（clip_groups + clip_group_members）是多对多关系：一条记录可以同时
+     属于多个分组；删除分组只删成员关系，绝不删除条目本身。
 """
 
 from __future__ import annotations
@@ -70,6 +72,26 @@ CREATE TABLE IF NOT EXISTS clip_vectors (
 );
 """
 
+#: 分组表：用户或 AI 创建的分组（名称唯一）
+CREATE_GROUPS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS clip_groups (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL UNIQUE,           -- 分组名（唯一，重名直接报错）
+    position    INTEGER NOT NULL DEFAULT 0,        -- 排序权重，越大越靠前
+    created_at  TEXT    NOT NULL                   -- 本地时间，格式 'YYYY-MM-DD HH:MM:SS'
+);
+"""
+
+#: 分组成员表：多对多（item_id 可同时属于多个 group_id）
+CREATE_GROUP_MEMBERS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS clip_group_members (
+    group_id    INTEGER NOT NULL,                  -- 对应 clip_groups.id
+    item_id     INTEGER NOT NULL,                  -- 对应 clipboard_items.id
+    added_at    TEXT    NOT NULL,
+    PRIMARY KEY (group_id, item_id)
+);
+"""
+
 CREATE_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_clipboard_items_created_at
     ON clipboard_items(created_at DESC);
@@ -77,6 +99,8 @@ CREATE INDEX IF NOT EXISTS idx_clipboard_items_pin
     ON clipboard_items(is_pinned, pinned_at DESC, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_clipboard_items_category
     ON clipboard_items(category);
+CREATE INDEX IF NOT EXISTS idx_clip_group_members_item
+    ON clip_group_members(item_id);
 """
 
 
@@ -116,7 +140,12 @@ def init_db() -> None:
             print(f"[提示] SQLite WAL 模式未生效（当前 {mode}），并发性能可能下降", flush=True)
         # 顺序很重要：先建表 -> 再补列（老库迁移）-> 最后建索引。
         # 索引里引用了 is_pinned 等后加的列，补列前建索引会在老库上报错。
-        conn.executescript(CREATE_TABLE_SQL + CREATE_VECTORS_TABLE_SQL)
+        conn.executescript(
+            CREATE_TABLE_SQL
+            + CREATE_VECTORS_TABLE_SQL
+            + CREATE_GROUPS_TABLE_SQL
+            + CREATE_GROUP_MEMBERS_TABLE_SQL
+        )
         _ensure_optional_columns(conn)  # 老库自动补齐置顶/分类/名称相关列
         conn.executescript(CREATE_INDEX_SQL)
         conn.commit()
@@ -311,27 +340,43 @@ def list_items(
     q: str | None = None,
     limit: int = 200,
     content_type: str | None = None,
+    group_id: int | None = None,
+    grouped: str = "all",
 ) -> list[dict[str, Any]]:
     """按展示顺序返回条目：置顶优先，其次按时间倒序。
 
     q 非空时对 text_content / source_app 做 LIKE 关键词搜索；
-    content_type 可传 'text' / 'image' 做类型过滤。
+    content_type 可传 'text' / 'image' 做类型过滤；
+    group_id 非空时只返回该分组的成员；
+    grouped 可传 'ungrouped'（只要无分组成员）/ 'grouped'（只要有分组成员）/ 'all'。
     返回字段与数据库行一致（含 image_path，仅供内部文件定位用）。
     """
-    sql = "SELECT * FROM clipboard_items"
+    sql = "SELECT DISTINCT i.* FROM clipboard_items i"
     params: list[Any] = []
     conditions: list[str] = []
+    if group_id is not None:
+        sql += " JOIN clip_group_members m ON m.item_id = i.id AND m.group_id = ?"
+        params.append(group_id)
+    if grouped == "ungrouped":
+        conditions.append(
+            "NOT EXISTS (SELECT 1 FROM clip_group_members gm WHERE gm.item_id = i.id)"
+        )
+    elif grouped == "grouped":
+        conditions.append(
+            "EXISTS (SELECT 1 FROM clip_group_members gm WHERE gm.item_id = i.id)"
+        )
     if q:
-        conditions.append("(text_content LIKE ? ESCAPE '\\' OR source_app LIKE ? ESCAPE '\\')")
+        conditions.append("(i.text_content LIKE ? ESCAPE '\\' OR i.source_app LIKE ? ESCAPE '\\')")
         like = f"%{escape_like(q)}%"
         params.extend([like, like])
     if content_type in ("text", "image"):
-        conditions.append("content_type = ?")
+        conditions.append("i.content_type = ?")
         params.append(content_type)
     if conditions:
         sql += " WHERE " + " AND ".join(conditions)
     sql += (
-        " ORDER BY is_pinned DESC, COALESCE(pinned_at, '') DESC, created_at DESC, id DESC LIMIT ?"
+        " ORDER BY i.is_pinned DESC, COALESCE(i.pinned_at, '') DESC, i.created_at DESC, i.id DESC"
+        " LIMIT ?"
     )
     params.append(limit)
     with closing(get_connection()) as conn:
@@ -396,6 +441,214 @@ def update_item_title(item_id: int, title: str) -> None:
             (title.strip() or None, item_id),
         )
         conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# 分组：clip_groups + clip_group_members（多对多，删分组不删条目）
+# ---------------------------------------------------------------------------
+
+
+def _now() -> str:
+    """本地时间字符串，格式 'YYYY-MM-DD HH:MM:SS'。"""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _next_position(conn: sqlite3.Connection) -> int:
+    """新建分组的排序权重：当前最大值 + 1（新分组排最前）。"""
+    row = conn.execute("SELECT COALESCE(MAX(position), 0) FROM clip_groups").fetchone()
+    return int(row[0]) + 1
+
+
+def create_group(name: str) -> int:
+    """新建分组，返回分组 id；名称为空或重名抛 ValueError。"""
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("分组名不能为空")
+    if len(name) > 30:
+        name = name[:30]
+    try:
+        with closing(get_connection()) as conn:
+            with conn:  # 单事务：插入失败自动回滚
+                cursor = conn.execute(
+                    "INSERT INTO clip_groups (name, position, created_at) VALUES (?, ?, ?)",
+                    (name, _next_position(conn), _now()),
+                )
+    except sqlite3.IntegrityError as exc:
+        # UNIQUE 冲突：同名分组已存在
+        raise ValueError("分组名已存在") from exc
+    return int(cursor.lastrowid)
+
+
+def rename_group(group_id: int, new_name: str) -> None:
+    """重命名分组；名称为空 / 与别的分组重名抛 ValueError。"""
+    new_name = (new_name or "").strip()
+    if not new_name:
+        raise ValueError("分组名不能为空")
+    if len(new_name) > 30:
+        new_name = new_name[:30]
+    try:
+        with closing(get_connection()) as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE clip_groups SET name = ? WHERE id = ?", (new_name, group_id)
+                )
+    except sqlite3.IntegrityError as exc:
+        raise ValueError("分组名已存在") from exc
+
+
+def delete_group(group_id: int) -> None:
+    """删除分组：只删分组行与成员关系，条目本身一律保留。"""
+    with closing(get_connection()) as conn:
+        with conn:  # 单事务：分组行与成员关系要么全删要么都不删
+            conn.execute("DELETE FROM clip_group_members WHERE group_id = ?", (group_id,))
+            conn.execute("DELETE FROM clip_groups WHERE id = ?", (group_id,))
+
+
+def get_group(group_id: int) -> dict[str, Any] | None:
+    """按 id 取单个分组（含成员数）；不存在返回 None。"""
+    with closing(get_connection()) as conn:
+        row = conn.execute(
+            """
+            SELECT g.id, g.name, g.position, g.created_at,
+                   (SELECT COUNT(*) FROM clip_group_members m WHERE m.group_id = g.id) AS count
+            FROM clip_groups g WHERE g.id = ?
+            """,
+            (group_id,),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def list_groups() -> list[dict[str, Any]]:
+    """全部分组（按 position 倒序 → 创建时间倒序），每个分组带成员计数。"""
+    with closing(get_connection()) as conn:
+        rows = conn.execute(
+            """
+            SELECT g.id, g.name, g.position, g.created_at, COUNT(m.item_id) AS count
+            FROM clip_groups g
+            LEFT JOIN clip_group_members m ON m.group_id = g.id
+            GROUP BY g.id
+            ORDER BY g.position DESC, g.created_at DESC, g.id DESC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def group_overview() -> dict[str, Any]:
+    """分组总览（供 GUI 侧边栏）：总条数、未分组数、分组列表（含计数）。"""
+    with closing(get_connection()) as conn:
+        total = conn.execute("SELECT COUNT(*) FROM clipboard_items").fetchone()[0]
+        ungrouped = conn.execute(
+            """
+            SELECT COUNT(*) FROM clipboard_items i
+            WHERE NOT EXISTS (
+                SELECT 1 FROM clip_group_members m WHERE m.item_id = i.id
+            )
+            """
+        ).fetchone()[0]
+    return {"total": int(total), "ungrouped": int(ungrouped), "groups": list_groups()}
+
+
+def item_group_ids(item_id: int) -> list[int]:
+    """某条目所属的全部分组 id（按分组排序）。"""
+    with closing(get_connection()) as conn:
+        rows = conn.execute(
+            """
+            SELECT m.group_id
+            FROM clip_group_members m
+            JOIN clip_groups g ON g.id = m.group_id
+            WHERE m.item_id = ?
+            ORDER BY g.position DESC, g.created_at DESC, g.id DESC
+            """,
+            (item_id,),
+        ).fetchall()
+    return [int(row[0]) for row in rows]
+
+
+def group_names_by_ids(ids: Sequence[int]) -> dict[int, list[str]]:
+    """批量取条目对应的分组名（供卡片显示分组徽章）。"""
+    if not ids:
+        return {}
+    placeholders = ",".join("?" * len(ids))
+    with closing(get_connection()) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT m.item_id, g.name
+            FROM clip_group_members m
+            JOIN clip_groups g ON g.id = m.group_id
+            WHERE m.item_id IN ({placeholders})
+            ORDER BY g.position DESC, g.created_at DESC, g.id DESC
+            """,
+            tuple(ids),
+        ).fetchall()
+    result: dict[int, list[str]] = {}
+    for row in rows:
+        result.setdefault(int(row["item_id"]), []).append(row["name"])
+    return result
+
+
+def add_item_to_group(item_id: int, group_id: int) -> bool:
+    """把条目加入分组；返回 True=新加入，False=本来就在组里。"""
+    with closing(get_connection()) as conn:
+        with conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO clip_group_members (group_id, item_id, added_at)"
+                " VALUES (?, ?, ?)",
+                (group_id, item_id, _now()),
+            )
+            return cursor.rowcount > 0
+
+
+def remove_item_from_group(item_id: int, group_id: int) -> bool:
+    """把条目移出分组；返回 True=确实移出过，False=本来就不在组里。"""
+    with closing(get_connection()) as conn:
+        with conn:
+            cursor = conn.execute(
+                "DELETE FROM clip_group_members WHERE group_id = ? AND item_id = ?",
+                (group_id, item_id),
+            )
+            return cursor.rowcount > 0
+
+
+def set_item_groups(item_id: int, group_ids: Sequence[int]) -> None:
+    """整体设置条目的分组（替换语义）：不在 group_ids 里的组一律移出。"""
+    wanted = [int(gid) for gid in group_ids]
+    with closing(get_connection()) as conn:
+        with conn:  # 单事务：清空 + 重写，避免中间态
+            if wanted:
+                placeholders = ",".join("?" * len(wanted))
+                existing = {
+                    int(row[0])
+                    for row in conn.execute(
+                        f"SELECT id FROM clip_groups WHERE id IN ({placeholders})", tuple(wanted)
+                    )
+                }
+            else:
+                existing = set()
+            conn.execute("DELETE FROM clip_group_members WHERE item_id = ?", (item_id,))
+            for gid in sorted(existing):
+                conn.execute(
+                    "INSERT INTO clip_group_members (group_id, item_id, added_at) VALUES (?, ?, ?)",
+                    (gid, item_id, _now()),
+                )
+
+
+def ungrouped_text_items(limit: int = 500) -> list[dict[str, Any]]:
+    """还没有任何分组的文本条目（供「AI 自动分组」使用，新的在前）。"""
+    with closing(get_connection()) as conn:
+        rows = conn.execute(
+            """
+            SELECT i.id, i.text_content
+            FROM clipboard_items i
+            WHERE i.content_type = 'text'
+              AND NOT EXISTS (
+                  SELECT 1 FROM clip_group_members m WHERE m.item_id = i.id
+              )
+            ORDER BY i.id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 class ContentConflictError(Exception):

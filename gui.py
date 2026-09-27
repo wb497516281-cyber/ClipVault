@@ -4,12 +4,15 @@
 功能：
   1. 顶部搜索框（300ms 防抖）+ 类型筛选（全部/文本/图片）；
   2. 配置 AI 后出现检索模式切换（智能/关键词/语义）；
-  3. 卡片：文本显示前若干字符，图片显示缩略图；元信息含时间/来源/类型/AI 分类/名称；
-  4. 点击卡片 → 写回系统剪贴板（文本 CF_UNICODETEXT；图片多格式，QQ/微信可粘贴）；
-  5. 悬停卡片出现「置顶 / 编辑 / 删除」按钮；删除两步确认；
-  6. 置顶条目排最前且不同底色 + 左侧强调条；
-  7. 每 5 秒自动刷新（数据没变不重绘，不闪）；剪贴板采集在后台线程运行；
-  8. 语义检索走后台线程 + 查询向量缓存，接口慢不冻结界面。
+  3. 左侧分组栏：全部 / 未分组 / 我的分组（带计数），支持新建/重命名/删除；
+  4. 卡片：文本显示前若干字符，图片显示缩略图；元信息含时间/来源/类型/AI 分类/分组/名称；
+  5. 点击卡片 → 写回系统剪贴板（文本 CF_UNICODETEXT；图片多格式，QQ/微信可粘贴）；
+  6. 悬停卡片出现「分组 / 置顶 / 编辑 / 删除」按钮；删除两步确认；
+  7. 「分组」按钮弹出成员菜单：勾选加入/移出分组、现场新建分组、✨AI 建议本条去哪组；
+  8. 分组栏「AI 自动分组」：后台把未分组条目分批交给分类模型归组（未配置 AI 自动降级）；
+  9. 置顶条目排最前且不同底色 + 左侧强调条；
+  10. 每 5 秒自动刷新（数据没变不重绘，不闪）；剪贴板采集在后台线程运行；
+  11. 语义检索走后台线程 + 查询向量缓存，接口慢不冻结界面。
 
 运行：python gui.py            （默认同时启动采集器）
       python gui.py --no-watch （只看界面，不采集）
@@ -22,13 +25,15 @@ from __future__ import annotations
 import sys
 import threading
 from datetime import datetime
+from typing import Any
 
 try:
     import tkinter as tk
-    from tkinter import messagebox, ttk
+    from tkinter import messagebox, simpledialog, ttk
 except ImportError:  # 非 Windows / 精简 Python 环境
     tk = None  # type: ignore[assignment]
     messagebox = None  # type: ignore[assignment]
+    simpledialog = None  # type: ignore[assignment]
     ttk = None  # type: ignore[assignment]
 
 import ai_client
@@ -64,6 +69,7 @@ C_TEXT = "#e8ecf1"
 C_DIM = "#8b96a5"
 C_ACCENT = "#5b9bff"
 C_DANGER = "#ef6b67"
+C_SIDEBAR = "#10131a"  # 左侧分组栏底色（比窗口底再深一档）
 
 #: 卡片几何
 CARD_PAD = 10  # 卡片间距
@@ -72,6 +78,13 @@ THUMB_SIZE = 150  # 缩略图边长
 TEXT_PREVIEW_CHARS = 300  # 文本预览字符数
 META_HEIGHT = 24  # 元信息行高
 BTN_HEIGHT = 26  # 悬停按钮高
+
+#: 左侧分组栏宽度
+SIDEBAR_WIDTH = 186
+
+#: 卡片悬停操作按钮：分组 / 置顶 / 编辑 / 删除（从左到右）
+ACTION_BTN_W = 52
+ACTION_BTN_GAP = 6
 
 
 def _fmt_time(created_at: str) -> str:
@@ -100,8 +113,8 @@ class ClipVaultGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title("ClipVault · 剪贴板历史")
-        root.geometry("860x640")
-        root.minsize(560, 420)
+        root.geometry("1060x660")
+        root.minsize(720, 420)
         root.configure(bg=C_BG)
 
         # 运行状态
@@ -121,6 +134,12 @@ class ClipVaultGUI:
         root._clipvault_gui = self  # noqa: SLF001
         # 语义检索的查询向量缓存：同一查询词不反复请求接口
         self._query_vec_cache: dict[str, list[float]] = {}
+        # —— 分组状态 ——
+        self.groups: dict[str, Any] = {"total": 0, "ungrouped": 0, "groups": []}  # 分组总览
+        self._group_sig: str | None = None  # 分组栏指纹（不变不重建，防闪烁）
+        self.group_id: int | None = None  # 当前查看的分组（None = 不在具体分组视图）
+        self.show_ungrouped: bool = False  # 当前是否查看「未分组」
+        self._group_menu_win: tk.Toplevel | None = None  # 卡片「分组」成员菜单
 
         self._build_widgets()
         self._load_and_render()
@@ -131,8 +150,14 @@ class ClipVaultGUI:
     # ------------------------------------------------------------------
 
     def _build_widgets(self) -> None:
-        """顶栏 + 画布 + 滚动条 + 提示条。"""
-        top = tk.Frame(self.root, bg=C_BG)
+        """左侧分组栏 + 顶栏 + 画布 + 滚动条 + 提示条。"""
+        self._build_sidebar()
+
+        # —— 右侧主区（顶栏 + 画布 + 提示） ——
+        main = tk.Frame(self.root, bg=C_BG)
+        main.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        top = tk.Frame(main, bg=C_BG)
         top.pack(fill=tk.X, padx=10, pady=(10, 6))
 
         # —— 搜索框 ——
@@ -210,7 +235,7 @@ class ClipVaultGUI:
         count_label.pack(side=tk.RIGHT, padx=(8, 2))
 
         # —— 画布 + 滚动条 ——
-        canvas_frame = tk.Frame(self.root, bg=C_BG)
+        canvas_frame = tk.Frame(main, bg=C_BG)
         canvas_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
 
         self.canvas = tk.Canvas(
@@ -233,7 +258,7 @@ class ClipVaultGUI:
         # —— 底部提示（toast） ——
         self.toast_var = tk.StringVar(value="")
         self.toast_label = tk.Label(
-            self.root,
+            main,
             textvariable=self.toast_var,
             bg="#222831",  # 注意：tkinter 只接受 6 位 hex，不能带透明度后缀
             fg="#ffffff",
@@ -280,7 +305,246 @@ class ClipVaultGUI:
         entry.bind("<FocusOut>", on_focus_out)
 
     # ------------------------------------------------------------------
-    # 数据加载（关键词 + 语义混合）
+    # 左侧分组栏：全部 / 未分组 / 我的分组（新建、重命名、删除、筛选）
+    # ------------------------------------------------------------------
+
+    def _build_sidebar(self) -> None:
+        """搭建分组栏骨架（静态部分）；动态分组按钮由 _rebuild_sidebar 填充。"""
+        self.sidebar = tk.Frame(self.root, bg=C_SIDEBAR, width=SIDEBAR_WIDTH)
+        self.sidebar.pack(side=tk.LEFT, fill=tk.Y)
+        self.sidebar.pack_propagate(False)  # 固定宽度，不随内容伸缩
+
+        # —— 新建分组按钮（沉底） ——
+        new_group_btn = tk.Button(
+            self.sidebar,
+            text="＋ 新建分组",
+            command=self._new_group_clicked,
+            bg=C_CARD,
+            fg=C_TEXT,
+            activebackground=C_CARD_HOVER,
+            activeforeground=C_TEXT,
+            relief=tk.FLAT,
+            font=("Microsoft YaHei UI", 10),
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
+        new_group_btn.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=8)
+
+        # —— 标题 ——
+        tk.Label(
+            self.sidebar,
+            text="🗂 分组",
+            bg=C_SIDEBAR,
+            fg=C_TEXT,
+            font=("Microsoft YaHei UI", 12, "bold"),
+        ).pack(side=tk.TOP, anchor=tk.W, padx=12, pady=(12, 6))
+
+        # —— AI 自动分组（未配置 AI 时置灰，安全降级） ——
+        self.auto_group_btn = tk.Button(
+            self.sidebar,
+            text="🤖 AI 自动分组",
+            command=self.start_auto_group,
+            bg=C_ACCENT if self.ai_configured else C_CARD,
+            fg="#ffffff" if self.ai_configured else C_DIM,
+            activebackground=C_CARD_HOVER,
+            activeforeground=C_TEXT,
+            relief=tk.FLAT,
+            font=("Microsoft YaHei UI", 10),
+            padx=10,
+            pady=3,
+            cursor="hand2",
+            state=tk.NORMAL if self.ai_configured else tk.DISABLED,
+        )
+        self.auto_group_btn.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
+
+        # —— 固定导航：全部 / 未分组（计数在 _rebuild_sidebar 更新） ——
+        self.group_nav_buttons: dict[str, tk.Button] = {}
+        for key, label in (("all", "全部条目"), ("ungrouped", "未分组")):
+            btn = tk.Button(
+                self.sidebar,
+                text=label,
+                command=lambda k=key: self._select_group(k),
+                bg=C_ACCENT,
+                fg="#ffffff",
+                activebackground=C_CARD_HOVER,
+                activeforeground=C_TEXT,
+                relief=tk.FLAT,
+                font=("Microsoft YaHei UI", 10),
+                padx=10,
+                pady=3,
+                anchor=tk.W,
+                cursor="hand2",
+            )
+            btn.pack(side=tk.TOP, fill=tk.X, padx=8, pady=1)
+            self.group_nav_buttons[key] = btn
+
+        # —— 分隔线 + 分组列表容器 ——
+        tk.Frame(self.sidebar, bg=C_BORDER, height=1).pack(
+            side=tk.TOP, fill=tk.X, padx=12, pady=6
+        )
+        self.group_list_frame = tk.Frame(self.sidebar, bg=C_SIDEBAR)
+        self.group_list_frame.pack(side=tk.TOP, fill=tk.X)
+        self.group_row_buttons: dict[int, tk.Button] = {}
+
+    def _rebuild_sidebar(self) -> None:
+        """刷新分组栏数据；分组指纹没变就跳过（常驻刷新不闪烁）。"""
+        try:
+            overview = storage.group_overview()
+        except Exception:
+            return  # 数据库异常时保留上次状态，不打断主流程
+        groups = overview["groups"]
+        sig = (
+            f"{overview['total']}|{overview['ungrouped']}|"
+            + "|".join(f"{g['id']}:{g['name']}:{g['count']}" for g in groups)
+        )
+        if sig == self._group_sig:
+            return
+        self._group_sig = sig
+        self.groups = overview
+
+        # 固定导航的计数文本
+        self.group_nav_buttons["all"].configure(text=f"全部条目（{overview['total']}）")
+        self.group_nav_buttons["ungrouped"].configure(text=f"未分组（{overview['ungrouped']}）")
+
+        # 动态分组按钮整体重建（条目量很小，重建比 diff 更省事）
+        for btn in self.group_row_buttons.values():
+            btn.destroy()
+        self.group_row_buttons = {}
+        for group in groups:
+            name = group["name"]
+            display = name if len(name) <= 12 else name[:11] + "…"
+            btn = tk.Button(
+                self.group_list_frame,
+                text=f"{display}（{group['count']}）",
+                command=lambda gid=group["id"]: self._select_group(gid),
+                bg=C_CARD,
+                fg=C_TEXT,
+                activebackground=C_CARD_HOVER,
+                activeforeground=C_TEXT,
+                relief=tk.FLAT,
+                font=("Microsoft YaHei UI", 9),
+                padx=10,
+                pady=3,
+                anchor=tk.W,
+                cursor="hand2",
+            )
+            # 右键菜单：重命名 / 删除分组
+            btn.bind("<Button-3>", lambda event, gid=group["id"]: self._on_group_right_click(event, gid))
+            btn.pack(fill=tk.X, padx=8, pady=1)
+            self.group_row_buttons[group["id"]] = btn
+        self._paint_group_button_styles()
+
+    def _paint_group_button_styles(self) -> None:
+        """按当前选中状态刷新分组栏按钮配色。"""
+        for key, btn in self.group_nav_buttons.items():
+            active = (key == "all" and not self.show_ungrouped and self.group_id is None) or (
+                key == "ungrouped" and self.show_ungrouped
+            )
+            btn.configure(bg=C_ACCENT if active else C_CARD, fg="#ffffff" if active else C_DIM)
+        for gid, btn in self.group_row_buttons.items():
+            active = self.group_id == gid
+            btn.configure(
+                bg=C_ACCENT if active else C_CARD,
+                fg="#ffffff" if active else C_DIM,
+                font=("Microsoft YaHei UI", 9, "bold" if active else "normal"),
+            )
+
+    def _select_group(self, key: int | str) -> None:
+        """切换分组视图：'all' / 'ungrouped' / 分组 id。"""
+        self._close_group_menu()  # 视图变化，先收起卡片分组菜单
+        if key == "all":
+            self.group_id = None
+            self.show_ungrouped = False
+        elif key == "ungrouped":
+            self.group_id = None
+            self.show_ungrouped = True
+        else:
+            self.group_id = int(key)
+            self.show_ungrouped = False
+        self._paint_group_button_styles()
+        self._cancel_pending_delete()  # 视图变化，作废未确认的删除
+        self._fingerprint = None
+        self._load_and_render()
+
+    def _active_group_name(self) -> str | None:
+        """当前查看的分组名（不在具体分组视图时返回 None）。"""
+        if self.group_id is None:
+            return None
+        for group in self.groups.get("groups", []):
+            if group["id"] == self.group_id:
+                return group["name"]
+        return None
+
+    def _new_group_clicked(self) -> None:
+        """新建分组（询问名称后创建，并直接切到该分组视图）。"""
+        name = simpledialog.askstring("新建分组", "分组名称：", parent=self.root)
+        if not name or not name.strip():
+            return
+        try:
+            group_id = storage.create_group(name)
+        except ValueError as exc:
+            messagebox.showwarning("新建分组", str(exc), parent=self.root)
+            return
+        self._toast(f"🗂 已创建分组「{name.strip()[:30]}」")
+        self._select_group(group_id)
+
+    def _on_group_right_click(self, event, group_id: int) -> None:
+        """分组按钮右键菜单：重命名 / 删除。"""
+        group = storage.get_group(group_id)
+        if group is None:
+            return
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=f"重命名「{group['name']}」", command=lambda: self._rename_group(group_id))
+        menu.add_separator()
+        menu.add_command(label="删除分组", command=lambda: self._delete_group(group_id))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _rename_group(self, group_id: int) -> None:
+        """重命名分组（预填当前名称）。"""
+        group = storage.get_group(group_id)
+        if group is None:
+            return
+        name = simpledialog.askstring(
+            "重命名分组", "新的分组名称：", initialvalue=group["name"], parent=self.root
+        )
+        if not name or not name.strip():
+            return
+        try:
+            storage.rename_group(group_id, name)
+        except ValueError as exc:
+            messagebox.showwarning("重命名分组", str(exc), parent=self.root)
+            return
+        self._toast(f"✏️ 已重命名为「{name.strip()[:30]}」")
+        self._fingerprint = None
+        self._load_and_render()
+
+    def _delete_group(self, group_id: int) -> None:
+        """删除分组（二次确认；条目本身不受影响，只是移出分组）。"""
+        group = storage.get_group(group_id)
+        if group is None:
+            return
+        confirmed = messagebox.askyesno(
+            "删除分组",
+            f"确定删除分组「{group['name']}」吗？\n组内 {group['count']} 条记录不会被删除，只是移出分组。",
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+        storage.delete_group(group_id)
+        # 如果正在看这个分组，退回「全部」视图
+        if self.group_id == group_id:
+            self.group_id = None
+            self.show_ungrouped = False
+        self._toast(f"🗑 已删除分组「{group['name']}」")
+        self._fingerprint = None
+        self._load_and_render()
+
+    # ------------------------------------------------------------------
+    # 数据加载（关键词 + 语义混合 + 分组过滤）
     # ------------------------------------------------------------------
 
     def _current_query(self) -> str:
@@ -290,15 +554,38 @@ class ClipVaultGUI:
         return self.search_var.get().strip()
 
     def _load_items_sync(self, q: str) -> list[dict]:
-        """关键词/列表路径：纯本地 SQLite，同步执行无感知。"""
+        """关键词/列表路径：纯本地 SQLite，同步执行无感知；遵守分组视图过滤。"""
+        group_id, grouped = None, "all"
+        if self.show_ungrouped:
+            grouped = "ungrouped"
+        elif self.group_id is not None:
+            group_id = self.group_id
         if q:
-            return storage.list_items(q=q, limit=LIST_LIMIT, content_type=self.type_filter)
-        return storage.list_items(limit=LIST_LIMIT, content_type=self.type_filter)
+            rows = storage.list_items(
+                q=q, limit=LIST_LIMIT, content_type=self.type_filter,
+                group_id=group_id, grouped=grouped,
+            )
+        else:
+            rows = storage.list_items(
+                limit=LIST_LIMIT, content_type=self.type_filter,
+                group_id=group_id, grouped=grouped,
+            )
+        return self._attach_group_names(rows)
+
+    def _attach_group_names(self, rows: list[dict]) -> list[dict]:
+        """给每行挂上 group_names（卡片显示分组徽章、语义路径本地过滤用）。"""
+        if not rows:
+            return rows
+        names_by_id = storage.group_names_by_ids([row["id"] for row in rows])
+        for row in rows:
+            row["group_names"] = names_by_id.get(row["id"], [])
+        return rows
 
     def _semantic_rows(self, q: str) -> list[dict]:
         """语义检索：查询词向量化后按余弦相似度排序；失败返回空列表（降级关键词）。
 
         查询向量带缓存：同一个查询词（含 5 秒自动刷新重复触发）不会反复请求接口。
+        分组视图在这里做本地过滤（语义候选本来就是全量向量里挑的）。
         """
         if not self.ai_configured:
             return []
@@ -325,7 +612,17 @@ class ClipVaultGUI:
         # 类型筛选
         if self.type_filter != "all":
             rows = [r for r in rows if r["content_type"] == self.type_filter]
-        return rows
+        rows = self._attach_group_names(rows)
+        return self._filter_rows_by_group_view(rows)
+
+    def _filter_rows_by_group_view(self, rows: list[dict]) -> list[dict]:
+        """按当前分组视图本地过滤（语义检索路径用；SQL 路径已在库里过滤）。"""
+        if self.show_ungrouped:
+            return [r for r in rows if not r.get("group_names")]
+        active = self._active_group_name()
+        if active is None:
+            return rows
+        return [r for r in rows if active in (r.get("group_names") or [])]
 
     def _load_and_render(self) -> None:
         """加载数据并渲染。
@@ -354,10 +651,15 @@ class ClipVaultGUI:
         self.root.after(0, self._apply_rows, rows)
 
     def _apply_rows(self, rows: list[dict]) -> None:
-        """主线程渲染入口：数据没变（指纹一致）就跳过重绘。"""
+        """主线程渲染入口：数据没变（指纹一致）就跳过重绘。
+
+        指纹纳入分组归属：分组变化（加入/移出/改名）必须触发重绘，
+        否则卡片上的分组徽章和分组栏计数会停在旧状态。
+        """
         self.items = rows
         fingerprint = "|".join(
-            f"{r['id']}:{r['is_pinned']}:{r['category'] or ''}:{r['content_type']}:{r.get('title') or ''}"
+            f"{r['id']}:{r['is_pinned']}:{r['category'] or ''}:{r['content_type']}:"
+            f"{r.get('title') or ''}:{','.join(r.get('group_names') or [])}"
             for r in self.items
         )
         if fingerprint == self._fingerprint:
@@ -389,16 +691,23 @@ class ClipVaultGUI:
         self.canvas.delete("all")
         self._card_rects.clear()
         self._img_refs.clear()
+        self._rebuild_sidebar()  # 分组栏计数与当前分组列表保持新鲜
 
         canvas_width = max(self.canvas.winfo_width(), 400)
         card_width = canvas_width - 2 * CARD_MARGIN
         y = CARD_MARGIN
 
         if not self.items:
+            if self.show_ungrouped:
+                empty_text = "没有未分组的条目（新内容都在这里出现）"
+            elif self.group_id is not None:
+                empty_text = "该分组还是空的，悬停卡片点「分组」把条目加进来"
+            else:
+                empty_text = "暂无剪贴板记录，去复制点内容试试～"
             self.canvas.create_text(
                 canvas_width // 2,
                 80,
-                text="暂无剪贴板记录，去复制点内容试试～",
+                text=empty_text,
                 fill=C_DIM,
                 font=("Microsoft YaHei UI", 12),
             )
@@ -496,11 +805,14 @@ class ClipVaultGUI:
                 tags=("card", f"card-{item['id']}"),
             )
 
-        # —— 元信息行：类型 + 时间 + 分类 + 来源 ——
+        # —— 元信息行：类型 + 时间 + 分类 + 分组 + 来源 ——
         type_label = "图片" if item["content_type"] == "image" else "文本"
         meta_text = f"{type_label} · {_fmt_time(item['created_at'])}"
         if item.get("category"):
             meta_text += f" · [{item['category']}]"
+        group_names = item.get("group_names") or []
+        if group_names:
+            meta_text += " · " + " ".join(f"#{name}" for name in group_names)
         meta_text += f" · {item.get('source_app') or '未知来源'}"
         self.canvas.create_text(
             x + 12,
@@ -581,12 +893,13 @@ class ClipVaultGUI:
             )
 
     def _draw_action_buttons(self, item: dict, card_x: int, card_y: int, card_w: int) -> None:
-        """在悬停卡片右上角画「置顶 / 编辑 / 删除」按钮。"""
-        btn_w, btn_h = 52, BTN_HEIGHT
-        gap = 6
-        x1 = card_x + card_w - btn_w * 3 - gap * 2 - 8
-        x2 = x1 + btn_w + gap
-        x3 = x2 + btn_w + gap
+        """在悬停卡片右上角画「分组 / 置顶 / 编辑 / 删除」按钮。"""
+        btn_w, btn_h = ACTION_BTN_W, BTN_HEIGHT
+        gap = ACTION_BTN_GAP
+        x1 = card_x + card_w - btn_w * 4 - gap * 3 - 8  # 分组
+        x2 = x1 + btn_w + gap  # 置顶
+        x3 = x2 + btn_w + gap  # 编辑
+        x4 = x3 + btn_w + gap  # 删除
         y = card_y + 8
 
         pinned = bool(item["is_pinned"])
@@ -613,10 +926,11 @@ class ClipVaultGUI:
                 tags=("action", f"{tag}-{item['id']}"),
             )
 
-        draw_btn(x1, "pin", pin_text, C_ACCENT, "#ffffff")
-        draw_btn(x2, "edit", "编辑", C_CARD, C_TEXT)
+        draw_btn(x1, "group", "分组", C_CARD, C_TEXT)
+        draw_btn(x2, "pin", pin_text, C_ACCENT, "#ffffff")
+        draw_btn(x3, "edit", "编辑", C_CARD, C_TEXT)
         draw_btn(
-            x3,
+            x4,
             "del",
             del_text,
             C_DANGER if del_pending else C_CARD,
@@ -628,30 +942,36 @@ class ClipVaultGUI:
     # ------------------------------------------------------------------
 
     def _hit_test(self, event) -> tuple[str | None, int | None]:
-        """把画布坐标上的点击解析成 ('action:pin'|'action:edit'|'action:del'|'card', item_id)。"""
+        """把画布坐标上的点击解析成
+        ('action:group'|'action:pin'|'action:edit'|'action:del'|'card', item_id)。"""
         x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
         # 先查悬停按钮（小区域优先）
         for item_id, (cx, cy, cw, ch) in self._card_rects.items():
             if not (cx <= x <= cx + cw and cy <= y <= cy + ch):
                 continue
-            btn_w, btn_h, gap = 52, BTN_HEIGHT, 6
-            bx1 = cx + cw - btn_w * 3 - gap * 2 - 8
-            bx2 = bx1 + btn_w + gap
-            bx3 = bx2 + btn_w + gap
+            btn_w, btn_h, gap = ACTION_BTN_W, BTN_HEIGHT, ACTION_BTN_GAP
+            bx1 = cx + cw - btn_w * 4 - gap * 3 - 8  # 分组
+            bx2 = bx1 + btn_w + gap  # 置顶
+            bx3 = bx2 + btn_w + gap  # 编辑
+            bx4 = bx3 + btn_w + gap  # 删除
             by = cy + 8
             if self.hovered_id == item_id:
                 if bx1 <= x <= bx1 + btn_w and by <= y <= by + btn_h:
-                    return ("action:pin", item_id)
+                    return ("action:group", item_id)
                 if bx2 <= x <= bx2 + btn_w and by <= y <= by + btn_h:
-                    return ("action:edit", item_id)
+                    return ("action:pin", item_id)
                 if bx3 <= x <= bx3 + btn_w and by <= y <= by + btn_h:
+                    return ("action:edit", item_id)
+                if bx4 <= x <= bx4 + btn_w and by <= y <= by + btn_h:
                     return ("action:del", item_id)
             return ("card", item_id)
         return (None, None)
 
     def _on_click(self, event) -> None:
         kind, item_id = self._hit_test(event)
-        if kind == "action:pin" and item_id is not None:
+        if kind == "action:group" and item_id is not None:
+            self._open_group_menu(event, item_id)
+        elif kind == "action:pin" and item_id is not None:
             self._toggle_pin(item_id)
         elif kind == "action:edit" and item_id is not None:
             self.open_editor(item_id)
@@ -663,7 +983,11 @@ class ClipVaultGUI:
     def _on_motion(self, event) -> None:
         """悬停高亮：只在其变化时重绘，避免拖动鼠标疯狂重画。"""
         kind, item_id = self._hit_test(event)
-        new_hover = item_id if kind in ("card", "action:pin", "action:edit", "action:del") else None
+        new_hover = (
+            item_id
+            if kind in ("card", "action:group", "action:pin", "action:edit", "action:del")
+            else None
+        )
         if new_hover != self.hovered_id:
             self.hovered_id = new_hover
             self._render()
@@ -739,11 +1063,297 @@ class ClipVaultGUI:
             # 只删数据目录内的文件，防路径穿越
             if path.is_file() and storage.IMAGE_DIR in path.parents:
                 path.unlink()
+        storage.set_item_groups(item_id, [])  # 连带清掉分组成员关系，不留孤儿行
         self._fingerprint = None
         # 先按指针位置恢复悬停再重绘，避免按钮门控失效
         self._refresh_hover_from_pointer()
         self._load_and_render()
         self._toast("🗑 已删除")
+
+    # ------------------------------------------------------------------
+    # 卡片「分组」成员菜单：勾选加入/移出 + 现场新建 + ✨AI 建议
+    # ------------------------------------------------------------------
+
+    def _open_group_menu(self, event, item_id: int) -> None:
+        """在卡片「分组」按钮下方弹出成员菜单（模态 Toplevel，勾选即时生效）。"""
+        # 模态互斥：设置窗/编辑窗开着时先提前面，避免两个模态窗抢 grab
+        if getattr(self, "_settings_win", None) is not None:
+            self._settings_win.lift()
+            self._settings_win.focus_set()
+            self._toast("请先关闭 AI 设置窗")
+            return
+        if getattr(self, "_editor_win", None) is not None:
+            self._editor_win.lift()
+            self._editor_win.focus_set()
+            self._toast("请先关闭编辑窗")
+            return
+        self._close_group_menu()
+
+        item = storage.get_item(item_id)
+        if item is None:
+            return
+        if item["content_type"] == "image":
+            header = "🖼 图片条目 · 选择分组"
+        else:
+            preview = " ".join((item.get("title") or item.get("text_content") or "").split())
+            if len(preview) > 22:
+                preview = preview[:22] + "…"
+            header = f"📄 {preview}" if preview else "📄 选择分组"
+
+        win = tk.Toplevel(self.root)
+        win.title("分组")
+        win.configure(bg=C_BG)
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        tk.Label(
+            win,
+            text=header,
+            bg=C_BG,
+            fg=C_DIM,
+            font=("Microsoft YaHei UI", 9),
+            wraplength=220,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, columnspan=2, padx=12, pady=(12, 6), sticky=tk.W)
+
+        current = set(storage.item_group_ids(item_id))
+        menu_vars: dict[int, tk.BooleanVar] = {}
+        if self.groups.get("groups"):
+            for group in self.groups["groups"]:
+                var = tk.BooleanVar(value=group["id"] in current)
+                menu_vars[group["id"]] = var
+                tk.Checkbutton(
+                    win,
+                    text=group["name"],
+                    variable=var,
+                    command=lambda gid=group["id"], v=var: self._toggle_item_group(item_id, gid, v.get()),
+                    bg=C_BG,
+                    fg=C_TEXT,
+                    selectcolor=C_CARD,
+                    activebackground=C_BG,
+                    activeforeground=C_TEXT,
+                    font=("Microsoft YaHei UI", 10),
+                    anchor=tk.W,
+                    padx=12,
+                ).grid(row=len(menu_vars), column=0, columnspan=2, padx=12, pady=1, sticky=tk.W + tk.E)
+        else:
+            tk.Label(
+                win,
+                text="（还没有分组，点下面按钮新建）",
+                bg=C_BG,
+                fg=C_DIM,
+                font=("Microsoft YaHei UI", 9),
+            ).grid(row=1, column=0, columnspan=2, padx=12, pady=2, sticky=tk.W)
+
+        row = len(menu_vars) + 1 + (0 if menu_vars else 1)  # 空态提示也占一行
+        # —— 底部动作：新建 / AI 建议 / 完成 ——
+        btn_row = tk.Frame(win, bg=C_BG)
+        btn_row.grid(row=row, column=0, columnspan=2, padx=12, pady=(10, 12), sticky=tk.E)
+
+        def make_btn(text, cmd, accent=False, enabled=True):
+            return tk.Button(
+                btn_row,
+                text=text,
+                command=cmd,
+                bg=C_ACCENT if accent else C_CARD,
+                fg="#ffffff" if accent else C_TEXT,
+                activebackground=C_CARD_HOVER,
+                activeforeground=C_TEXT,
+                relief=tk.FLAT,
+                font=("Microsoft YaHei UI", 9),
+                padx=10,
+                pady=2,
+                cursor="hand2",
+                state=tk.NORMAL if enabled else tk.DISABLED,
+            )
+
+        make_btn("＋ 新建分组…", lambda: self._group_menu_new(item_id)).pack(side=tk.LEFT, padx=(0, 6))
+        make_btn(
+            "✨ AI 建议",
+            lambda: self._group_menu_ai_suggest(item_id),
+            enabled=self.ai_configured,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        make_btn("完成", self._close_group_menu, accent=True).pack(side=tk.LEFT)
+
+        # 定位到按钮下方（事件坐标是屏幕坐标）
+        x = max(0, event.x_root - 60)
+        y = event.y_root + BTN_HEIGHT + 6
+        win.geometry(f"+{x}+{y}")
+        self._group_menu_win = win
+        self._group_menu_item = item_id
+        self._group_menu_vars = menu_vars
+        win.protocol("WM_DELETE_WINDOW", self._close_group_menu)
+        win.grab_set()  # 模态：菜单开着期间不操作主窗口，避免悬停重绘错位
+        win.focus_set()
+
+    def _close_group_menu(self) -> None:
+        """关闭分组成员菜单（释放模态）。"""
+        win = getattr(self, "_group_menu_win", None)
+        if win is None:
+            return
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        win.destroy()
+        self._group_menu_win = None
+
+    def _toggle_item_group(self, item_id: int, group_id: int, on: bool) -> None:
+        """勾选加入/移出分组（即时写入并刷新列表与分组栏计数）。"""
+        if on:
+            storage.add_item_to_group(item_id, group_id)
+        else:
+            storage.remove_item_from_group(item_id, group_id)
+        self._group_sig = None  # 计数可能变化，强制刷新分组栏
+        self._fingerprint = None
+        self._load_and_render()
+
+    def _group_menu_new(self, item_id: int) -> None:
+        """成员菜单里现场新建分组，并把这件条目直接加进去。"""
+        parent = self._group_menu_win or self.root
+        name = simpledialog.askstring("新建分组", "分组名称：", parent=parent)
+        if not name or not name.strip():
+            return
+        try:
+            group_id = storage.create_group(name)
+        except ValueError as exc:
+            messagebox.showwarning("新建分组", str(exc), parent=parent)
+            return
+        storage.add_item_to_group(item_id, group_id)
+        self._close_group_menu()
+        self._toast(f"🗂 已加入新分组「{name.strip()[:30]}」")
+        self._group_sig = None
+        self._fingerprint = None
+        self._load_and_render()
+
+    def _group_menu_ai_suggest(self, item_id: int) -> None:
+        """AI 建议本条去哪组（后台线程，不阻塞 UI；未配置 AI 自动降级）。"""
+        item = storage.get_item(item_id)
+        if item is None:
+            return
+        text = (item.get("text_content") or "").strip()
+        if not text:
+            self._toast("图片条目不做 AI 建议分组", error=True)
+            return
+        existing = [g["name"] for g in self.groups.get("groups", [])]
+        self._toast("✨ AI 建议中…")
+
+        def _run():
+            try:
+                name = ai_client.suggest_group(text, existing)
+            except Exception:
+                name = None
+            self.root.after(0, self._apply_ai_group_suggestion, item_id, name)
+
+        threading.Thread(target=_run, name="clipvault-group-suggest", daemon=True).start()
+
+    def _apply_ai_group_suggestion(self, item_id: int, name: str | None) -> None:
+        """应用 AI 的单条分组建议（主线程执行）。"""
+        if not name:
+            self._toast("AI 没给出建议（未配置或接口失败）", error=True)
+            return
+        # 同名分组直接复用；没有就新建（并发重名时回退查库）
+        group_id = next(
+            (g["id"] for g in self.groups.get("groups", []) if g["name"] == name), None
+        )
+        created = False
+        if group_id is None:
+            try:
+                group_id = storage.create_group(name)
+                created = True
+            except ValueError:
+                group_id = next(
+                    (g["id"] for g in storage.list_groups() if g["name"] == name), None
+                )
+        if group_id is None:
+            self._toast(f"无法加入分组「{name}」", error=True)
+            return
+        storage.add_item_to_group(item_id, group_id)
+        # 菜单还开着就把对应勾打上，用户能立刻看到结果
+        win = self._group_menu_win
+        if win is not None and getattr(self, "_group_menu_item", None) == item_id:
+            var = self._group_menu_vars.get(group_id)
+            if var is not None:
+                var.set(True)
+        self._toast(f"✨ AI 建议：加入「{name}」" + ("（新分组）" if created else ""))
+        self._group_sig = None
+        self._fingerprint = None
+        self._load_and_render()
+
+    # ------------------------------------------------------------------
+    # AI 自动分组：后台分批把未分组条目交给分类模型归组
+    # ------------------------------------------------------------------
+
+    def start_auto_group(self) -> None:
+        """启动 AI 自动分组（后台线程；完成后回主线程刷新并汇报）。"""
+        if not self.ai_configured:
+            self._toast("AI 未配置：请先在「AI 设置」里配好 Key", error=True)
+            return
+        if getattr(self, "_auto_group_running", False):
+            self._toast("AI 自动分组正在进行中…")
+            return
+        self._auto_group_running = True
+        self._toast("🤖 AI 自动分组中（后台处理）…")
+        threading.Thread(
+            target=self._auto_group_worker, name="clipvault-auto-group", daemon=True
+        ).start()
+
+    def _run_auto_group(self) -> str:
+        """同步执行 AI 自动分组（后台线程调用）；返回汇报文案。
+
+        流程：取未分组文本 -> 分批交给模型分配 -> 新建缺失分组 -> 写入成员关系。
+        任一批次失败只丢该批，其余批次结果仍然生效。
+        """
+        rows = storage.ungrouped_text_items(500)
+        if not rows:
+            return "没有未分组的条目"
+        payload = [(row["id"], row["text_content"] or "") for row in rows]
+        existing = [g["name"] for g in storage.list_groups()]
+        mapping = ai_client.assign_groups(payload, existing)
+        if not mapping:
+            return "AI 未给出分组建议（未配置或接口失败）"
+        name_to_id = {g["name"]: g["id"] for g in storage.list_groups()}
+        created = assigned = failed = 0
+        for item_id, group_name in mapping.items():
+            group_id = name_to_id.get(group_name)
+            if group_id is None:
+                try:
+                    group_id = storage.create_group(group_name)
+                    name_to_id[group_name] = group_id
+                    created += 1
+                except ValueError:
+                    # 并发/重名：回退查库；仍找不到才记失败
+                    group_id = next(
+                        (g["id"] for g in storage.list_groups() if g["name"] == group_name), None
+                    )
+                    if group_id is None:
+                        failed += 1
+                        continue
+            try:
+                storage.add_item_to_group(item_id, group_id)
+                assigned += 1
+            except Exception:
+                failed += 1
+        message = f"AI 分组完成：{assigned} 条入组，新建 {created} 个分组"
+        if failed:
+            message += f"，{failed} 条失败"
+        return message
+
+    def _auto_group_worker(self) -> None:
+        """后台包装：跑同步逻辑，结果回主线程刷新（tkinter 非线程安全）。"""
+        try:
+            message = self._run_auto_group()
+        except Exception as exc:
+            message = f"AI 分组出错：{exc}"
+        self.root.after(0, self._finish_auto_group, message)
+
+    def _finish_auto_group(self, message: str) -> None:
+        """主线程收尾：刷新列表与分组栏，toast 汇报。"""
+        self._auto_group_running = False
+        self._group_sig = None
+        self._fingerprint = None
+        self._load_and_render()
+        self._toast(message)
 
     def _on_type_filter(self, key: str) -> None:
         self.type_filter = key
@@ -1131,6 +1741,12 @@ class ClipVaultGUI:
         self.ai_configured = ai_client.is_configured()
         self._rebuild_mode_buttons()
         self.settings_btn.configure(fg=C_ACCENT if self.ai_configured else C_DIM)
+        # AI 自动分组按钮跟随 AI 配置状态：未配置时置灰（安全降级，不乱调接口）
+        self.auto_group_btn.configure(
+            state=tk.NORMAL if self.ai_configured else tk.DISABLED,
+            bg=C_ACCENT if self.ai_configured else C_CARD,
+            fg="#ffffff" if self.ai_configured else C_DIM,
+        )
         # 通知外部（托盘）刷新动态菜单：pystray 菜单只构建一次，需显式 update_menu
         hook = getattr(self, "notify_hook", None)
         if hook is not None:
@@ -1388,6 +2004,7 @@ class ClipVaultGUI:
                 except Exception:
                     pass
                 setattr(self, attr, None)
+        self._close_group_menu()  # 拆卸窗口时顺手收起模态菜单，释放 grab
 
     def _schedule_refresh(self) -> None:
         """每 5 秒拉一次数据；指纹不变不重绘（不闪）。"""

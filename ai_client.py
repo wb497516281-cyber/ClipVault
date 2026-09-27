@@ -1,17 +1,19 @@
-"""ai_client.py — 可选 AI 能力：文本分类 + 语义向量化 + 语义检索辅助。
+"""ai_client.py — 可选 AI 能力：文本分类 + 语义向量化 + 智能分组 + 语义检索辅助。
 
 依赖：仅 Python 标准库（urllib/json/math），不引入任何第三方 HTTP 库。
 
 设计原则（对应项目硬性约束）：
   1. **完全可选**：未配置 API Key（或显式 CLIPVAULT_AI_ENABLED=0）时，
-     所有函数安全降级 —— 分类返回 None、向量返回 None、语义检索不参与，
-     核心功能（采集/存储/关键词搜索）零影响；
+     所有函数安全降级 —— 分类返回 None、向量返回 None、分组返回空 dict、
+     语义检索不参与，核心功能（采集/存储/关键词搜索）零影响；
   2. **API Key 只走环境变量**：从 os.environ 读取，绝不硬编码；
      通过 OpenAI 兼容接口调用，换服务商只需改 CLIPVAULT_AI_BASE_URL；
   3. **不阻塞采集**：分析任务丢进后台队列，由守护线程处理；
      失败只记日志，绝不让 watcher / API 崩溃；
   4. 这里的「向量」是文本语义向量，与「图片不存 BLOB」的约束无关：
      图片原图与缩略图仍然只存文件路径，数据库 BLOB 仅用于 float32 文本向量。
+  5. **智能分组**只依赖分类模型（chat），只用文本摘要，不发送整篇内容；
+     输出按 JSON 数组约定，解析层做围栏/废话/字段缺失的容错。
 """
 
 from __future__ import annotations
@@ -277,7 +279,175 @@ def classify_text(text: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# 能力二：语义向量化
+# 能力二：智能分组（批量分配到现有分组 / 按需新建分组）
+#
+# 只用分类模型（chat），不依赖向量接口：DeepSeek、Moonshot 这类没有 embedding
+# 的厂商也能用。输出约定为 JSON 数组 [{"id": 1, "group": "分组名"}, ...]，
+# 解析层对 markdown 围栏、前后废话、字段缺失一律容错。
+# ---------------------------------------------------------------------------
+
+#: AI 自动分组的每批条数：单批过大容易触发超时或输出被 max_tokens 截断
+GROUP_BATCH_SIZE = 40
+
+#: 单批允许新建的最大分组数（防止模型发疯一样造一堆分组）
+GROUP_MAX_NEW_PER_BATCH = 8
+
+
+def _preview_for_grouping(text: str, max_chars: int = 120) -> str:
+    """内容摘要：换行压平 + 截断，减少 token 消耗。"""
+    flat = " ".join((text or "").split())
+    return flat[:max_chars]
+
+
+def parse_group_assignment(
+    content: str,
+    valid_ids: set[int] | None = None,
+    existing_groups: Sequence[str] = (),
+    max_new_groups: int = GROUP_MAX_NEW_PER_BATCH,
+) -> dict[int, str]:
+    """把模型输出解析成 {item_id: group_name}。
+
+    容错点（模型经常不听话）：
+      - ```json 代码围栏 / JSON 前后带解释文字：截取首个 '[' 或 '{' 到末个 ']'/'}'；
+      - 输出为 {"1": "分组"} 字典形态：按 id -> group 处理；
+      - 数组元素缺 id / group 字段、group 非字符串：跳过该条；
+      - id 不在 valid_ids（本次提交的条目）：忽略，绝不张冠李戴；
+      - 分组名超长或带引号/标点：清理后仍超长则跳过；
+      - 不在 existing_groups 里的「新分组名」超过 max_new_groups 时，
+        多出的分配丢弃（宁可少分也不错分）。
+    """
+    if not isinstance(content, str) or not content.strip():
+        return {}
+    existing_set = {g.strip() for g in existing_groups if g and g.strip()}
+    text = content.strip()
+    # 去掉 markdown 代码围栏（```json ... ```）
+    if text.startswith("```"):
+        lines = text.splitlines()
+        lines = lines[1:] if len(lines) > 1 else []
+        while lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    starts = [pos for pos in (text.find("["), text.find("{")) if pos >= 0]
+    if not starts:
+        return {}
+    start = min(starts)
+    end = max(text.rfind("]"), text.rfind("}"))
+    if end <= start:
+        return {}
+    try:
+        data = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return {}
+
+    pairs: list[tuple[int, str]] = []
+    if isinstance(data, dict):
+        # {"1": "工作", "2": "代码"} 形态
+        for key, value in data.items():
+            try:
+                pairs.append((int(key), value if isinstance(value, str) else ""))
+            except (TypeError, ValueError):
+                continue
+    elif isinstance(data, list):
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                item_id = int(entry.get("id"))  # type: ignore[arg-type]
+            except (KeyError, TypeError, ValueError):
+                continue
+            name = entry.get("group") or entry.get("name") or entry.get("分组")
+            pairs.append((item_id, name if isinstance(name, str) else ""))
+    else:
+        return {}
+
+    result: dict[int, str] = {}
+    new_count = 0
+    for item_id, raw_name in pairs:
+        if valid_ids is not None and item_id not in valid_ids:
+            continue
+        name = raw_name.strip().strip("\"'`。；;，, ")
+        if not name or len(name) > 30:
+            continue
+        if name in existing_set or name in result.values():
+            result[item_id] = name  # 复用现有/已收分组名，不占新建额度
+            continue
+        new_count += 1
+        if new_count > max_new_groups:
+            continue
+        result[item_id] = name
+    return result
+
+
+def assign_groups(
+    rows: Sequence[tuple[int, str]],
+    existing_groups: Sequence[str] = (),
+) -> dict[int, str]:
+    """把一批条目分配给分组；rows 为 [(item_id, 内容摘要), ...]。
+
+    - 优先复用 existing_groups 里的同名分组，不合适才新建；
+    - 每 GROUP_BATCH_SIZE 条一批，顺序发送，后一批能复用前一批新建的分组名；
+    - 未配置 AI / 网络失败 / 解析失败时该批整体跳过，返回已拿到的部分结果；
+    - 绝不对不存在的 item_id 造结果（valid_ids 门控）。
+    """
+    if not is_configured() or not rows:
+        return {}
+    existing = [g.strip() for g in existing_groups if g and g.strip()]
+    result: dict[int, str] = {}
+    for start in range(0, len(rows), GROUP_BATCH_SIZE):
+        batch = rows[start : start + GROUP_BATCH_SIZE]
+        valid_ids = {item_id for item_id, _ in batch}
+        existing_text = "、".join(dict.fromkeys(existing)) if existing else "（暂无，可自行新建）"
+        payload = {
+            "model": _get_setting("CHAT_MODEL", CHAT_MODEL),
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是剪贴板内容分组助手。下面给你 {n} 条剪贴板记录，每条带编号和内容摘要。\n"
+                        "请为每条记录选一个最合适的分组：\n"
+                        f"1. 优先复用现有分组：{existing_text}；全都明显不合适时才新建；\n"
+                        f"2. 新分组名用简短中文（2~6 个字），本批新建不超过 {GROUP_MAX_NEW_PER_BATCH} 个；\n"
+                        "3. 每条必须且只能归入一个分组，编号必须原样保留；\n"
+                        "4. 只输出 JSON 数组，不要解释、不要代码围栏：\n"
+                        '[{{"id": 1, "group": "分组名"}}, ...]'
+                    ).format(n=len(batch)),
+                },
+                {
+                    "role": "user",
+                    "content": "\n".join(
+                        f"{item_id}. {_preview_for_grouping(text or '')}" for item_id, text in batch
+                    ),
+                },
+            ],
+            "temperature": 0,
+            "max_tokens": max(128, len(batch) * 24),
+        }
+        data = _post_json("/chat/completions", payload)
+        if not data:
+            logger.info("AI 分组批次失败（第 %d 批，共 %d 条）", start, len(batch))
+            continue
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            continue
+        assigned = parse_group_assignment(content, valid_ids, existing)
+        if assigned:
+            result.update(assigned)
+            # 后一批沿用本批新建的分组名，避免同内容分裂成两个组
+            existing.extend(dict.fromkeys(assigned.values()))
+    return result
+
+
+def suggest_group(text: str, existing_groups: Sequence[str] = ()) -> str | None:
+    """单条内容的分组建议（复用现有分组优先）；未配置/失败返回 None。"""
+    if not is_configured() or not (text or "").strip():
+        return None
+    result = assign_groups([(0, text)], list(existing_groups))
+    return result.get(0)
+
+
+# ---------------------------------------------------------------------------
+# 能力三：语义向量化
 # ---------------------------------------------------------------------------
 
 

@@ -43,11 +43,15 @@ def clean_db():
     with closing(storage.get_connection()) as conn:
         conn.execute("DELETE FROM clipboard_items")
         conn.execute("DELETE FROM clip_vectors")
+        conn.execute("DELETE FROM clip_group_members")
+        conn.execute("DELETE FROM clip_groups")
         conn.commit()
     yield
     with closing(storage.get_connection()) as conn:
         conn.execute("DELETE FROM clipboard_items")
         conn.execute("DELETE FROM clip_vectors")
+        conn.execute("DELETE FROM clip_group_members")
+        conn.execute("DELETE FROM clip_groups")
         conn.commit()
 
 

@@ -101,6 +101,13 @@ class TrayApp:
         self.root.after(0, self._gui.open_settings)
         self.root.after(0, self.root.deiconify)
 
+    def auto_group_ai(self, icon=None, item=None) -> None:
+        """触发 GUI 的「AI 自动分组」后台任务（未配置 AI 时 GUI 内部安全降级）。"""
+        if self._gui is None:
+            return
+        self.root.after(0, self._gui.start_auto_group)
+        self.root.after(0, self.root.deiconify)
+
     def toggle_pause(self, icon=None, item=None) -> None:
         if self.pause_event.is_set():
             self.pause_event.clear()
@@ -188,6 +195,7 @@ class TrayApp:
         return pystray.Menu(
             pystray.MenuItem("打开界面", self.open_window, default=True),
             pystray.MenuItem("AI 设置…", self.open_settings),
+            pystray.MenuItem("AI 自动分组…", self.auto_group_ai, enabled=self.ai_enabled),
             pystray.MenuItem("暂停采集", self.toggle_pause, checked=self.is_paused),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("开机自启动", self.toggle_autostart, checked=self.autostart_enabled),

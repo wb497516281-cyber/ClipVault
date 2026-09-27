@@ -7,6 +7,7 @@
 ## ✨ 功能特性
 
 - 🔄 **后台自动采集**：0.5 秒轮询剪贴板，文本和图片（复制/截图）自动入库
+- 🗂️ **分组（AI + 手动）**：左侧分组栏把历史按项目/类型归拢；悬停卡片点「分组」勾选加入（可多选）、现场新建；「AI 自动分组」后台分批把未分组条目交给分类模型归组（优先复用现有分组，缺了就新建），单条还能让 AI 建议去哪组
 - 🖼️ **图片完整留存**：原图 + 200×200 缩略图存 `clipboard_data/images/`，数据库只存相对路径（**绝不存 BLOB**）
 - ⚡ **内容去重**：文本按 `sha256(text)`，图片按「转 RGB 后 PNG 字节」做像素级哈希，重复内容不重复入库
 - 🔍 **两级搜索**：关键词 LIKE 搜索（默认，纯本地）+ 语义向量搜索（可选 AI），窗口顶栏可切换「智能/关键词/语义」
@@ -38,19 +39,20 @@
 clipvault/
 ├── gui.py               # 原生 GUI 主界面（tkinter Canvas 画布列表）
 ├── clipwriter.py        # 剪贴板写回（文本 CF_UNICODETEXT；图片 CF_DIB+CF_BITMAP+PNG 多格式）
-├── storage.py           # SQLite 存储层：建表/迁移/插入/去重/列表搜索/置顶/删除/向量
+├── storage.py           # SQLite 存储层：建表/迁移/插入/去重/列表搜索/置顶/删除/分组/向量
 ├── watcher.py           # 剪贴板采集主循环（0.5s 轮询、图片优先、独占重试）
 ├── ai_client.py         # 可选 AI：分类/向量化/余弦相似度/后台队列（未配置自动降级）
 ├── config.py            # 配置：.env 加载 + CLIPVAULT_* 环境变量
 ├── tray.py              # 托盘常驻版（采集 + GUI 一体，需 pystray）
 ├── autostart.py         # 开机自启动管理（HKCU Run 键，无需管理员权限）
 ├── make_icon.py         # 生成 assets/ 图标（托盘 + exe）
-├── tests/               # pytest 测试（91 个用例，含真实 GUI 冒烟）
+├── tests/               # pytest 测试（124 个用例，含真实 GUI 冒烟）
 │   ├── conftest.py      #   隔离数据目录 + 每用例清库 + 默认关闭 AI + 队列排空
 │   ├── test_config.py   #   设置文件读写 / 优先级 / .env 解析 / 原子写 / 缓存
 │   ├── test_storage.py  #   建表/迁移/去重/列表搜索/置顶/删除/编辑命名/向量
 │   ├── test_watcher.py  #   哈希规则/命名/入库/去重/孤儿文件清理
 │   ├── test_ai_client.py#   降级/解析/相似度/队列/厂商预设/拉取模型/陈旧任务
+│   ├── test_groups.py   #   分组：CRUD/成员多对多/列表过滤/计数/AI 解析分配
 │   ├── test_clipwriter.py#  格式转换 + QQ/微信多格式剪贴板（真实剪贴板验证）
 │   └── test_gui.py      #   真实 tkinter 窗口冒烟（渲染/筛选/置顶/删除两步/编辑保存/设置窗/命中）
 ├── assets/              # 图标（make_icon.py 生成）
@@ -127,6 +129,10 @@ python autostart.py remove     # 移除
 | 搜索 | 顶部搜索框输入关键词（300ms 防抖，无需回车）|
 | 切换检索模式 | 顶栏「智能 / 关键词 / 语义」（配置 AI 后才显示）|
 | 筛选类型 | 「全部 / 文本 / 图片」|
+| **分组浏览** | 左栏点分组名 / 「未分组」，只看该组内容 |
+| **手动分组** | 悬停卡片 → 「分组」→ 勾选加入/移出（可多选）、＋新建分组、✨AI 建议本条去哪组 |
+| **AI 自动分组** | 左栏「🤖 AI 自动分组」（或托盘菜单）：后台把未分组条目分批交给分类模型归组，跑完汇报新建几个组、入组几条 |
+| 分组管理 | 左栏右键分组 → 重命名 / 删除（删组不删条目）；底部「＋ 新建分组」|
 | 配置 AI | 顶栏「AI 设置」按钮（托盘模式也可从托盘菜单进入）|
 | 编辑条目 | 悬停卡片 → 「编辑」按钮（改文本内容 / 命名）|
 | 复制回剪贴板 | **点击卡片**（可直接粘贴到 QQ/微信）|
@@ -167,6 +173,8 @@ python autostart.py remove     # 移除
 
 **优先级**：界面设置（settings.json）> 环境变量 / `.env` > 内置默认值。界面是最近一次显式操作，当场生效；想用环境变量锁定配置，清空界面设置即可。
 
+> AI 分组（自动分组 / AI 建议）与自动分类共用「分类模型」，不需要向量接口；未配 Key 时分组按钮自动置灰，纯本地功能不受影响。每批最多 40 条、每批最多新建 8 个分组，某批请求失败只丢该批，其余结果照常生效。
+
 > 备选：也可以 `copy .env.example .env` 用环境变量配置（适合脚本/部署场景），效果等同。
 
 ## 🗄️ 数据说明
@@ -195,6 +203,10 @@ clipboard_items(
 
 -- clip_vectors 表：item_id 对应 clipboard_items.id，仅文本有条目
 clip_vectors(item_id, model, dim, vector BLOB, updated_at)
+
+-- 分组（多对多）：一条记录可同时属于多个分组；删分组只删成员关系，不动条目
+clip_groups(id, name UNIQUE, position, created_at)
+clip_group_members(group_id, item_id, added_at, PRIMARY KEY(group_id, item_id))
 ```
 
 ## ⚙️ 配置
@@ -222,7 +234,7 @@ pyinstaller packaging.spec
 
 ```powershell
 pip install -e ".[dev]"
-pytest                        # 91 个用例，无需网络；GUI 用例需要桌面环境
+pytest                        # 124 个用例，无需网络；GUI 用例需要桌面环境
 ruff check .                  # 代码规范检查
 ```
 
@@ -256,12 +268,12 @@ ruff check .                  # 代码规范检查
 
 - [x] 原生桌面 GUI（tkinter Canvas）
 - [x] AI 分类（自动打标签）与语义搜索
+- [x] 分组：AI 自动分组 + 手动分组（左栏筛选 / 卡片菜单 / 分组管理）
 - [x] 系统托盘图标 / 暂停采集 / 开机自启
 - [x] 打包为独立 exe（PyInstaller）
 - [x] 自动化测试（pytest，含 GUI 冒烟）
 - [ ] 跨平台支持（macOS/Linux 剪贴板后端）
 - [ ] 历史上限与自动清理策略
-- [ ] 剪贴板内容「收藏夹」分组
 
 ## 📄 开源协议
 
