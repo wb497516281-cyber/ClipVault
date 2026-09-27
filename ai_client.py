@@ -96,6 +96,21 @@ PROVIDERS: dict[str, dict[str, str]] = {
 #: 单次请求超时（秒）
 REQUEST_TIMEOUT = 10.0
 
+#: 最近一次请求失败的底层原因（供「连接测试」展示，纯诊断用）
+_last_error: str | None = None
+
+
+def _note_error(exc: Exception) -> None:
+    """记录最近一次失败的简短原因（HTTP 码 / 异常摘要），供连接自检展示。"""
+    global _last_error
+    text = str(exc).strip() or type(exc).__name__
+    _last_error = text[:120]
+
+
+def last_error() -> str | None:
+    """最近一次请求失败的原因（没有则 None）。"""
+    return _last_error
+
 
 def _get_setting(name: str, default: str) -> str:
     """读取 CLIPVAULT_AI_* 配置（界面设置 > 环境变量 > 默认值）。"""
@@ -185,6 +200,30 @@ def _post_json(path: str, payload: dict) -> dict | None:
         OSError,
     ) as exc:
         logger.warning("AI 请求失败（%s）：%s", url, exc)
+        _note_error(exc)
+        return None
+    """GET JSON（OpenAI 兼容接口）；配了 Key 自动带鉴权，失败只记日志返回 None。"""
+    base = _get_setting("BASE_URL", API_BASE).strip().rstrip("/")
+    if not base:
+        return None
+    url = base + path
+    headers = {"Content-Type": "application/json"}
+    key = get_api_key()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=get_timeout()) as response:
+            return json.loads(response.read().decode("utf-8", errors="replace"))
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        json.JSONDecodeError,
+        OSError,
+    ) as exc:
+        logger.warning("AI 请求失败（%s）：%s", url, exc)
+        _note_error(exc)
         return None
 
 
@@ -210,6 +249,7 @@ def _get_json(path: str) -> dict | None:
         OSError,
     ) as exc:
         logger.warning("AI 请求失败（%s）：%s", url, exc)
+        _note_error(exc)
         return None
 
 
@@ -227,6 +267,65 @@ def fetch_models() -> list[str]:
         return []
     ids = [str(row.get("id")) for row in rows if isinstance(row, dict) and row.get("id")]
     return sorted(dict.fromkeys(ids))
+
+
+# ---------------------------------------------------------------------------
+# 连接自检（设置窗「测试连接」）：按当前实际配置探测，而不是无脑测向量
+#
+# DeepSeek / Moonshot 等厂商没有 embedding 接口，旧实现只测 /embeddings，
+# 导致「Key 和对话接口明明好的」也永远显示连接失败。现在：
+#   配了向量模型 -> 测 /embeddings（返回维度）；
+#   没配向量模型 -> 测 /chat/completions（最小请求，回复任意内容即算通）。
+# 失败时带上底层原因（HTTP 码/异常摘要），方便用户自己排查。
+# ---------------------------------------------------------------------------
+
+
+def _chat_ping() -> str | None:
+    """最小对话请求：用来验证 chat 接口与 Key 是否可用。"""
+    data = _post_json(
+        "/chat/completions",
+        {
+            "model": _get_setting("CHAT_MODEL", CHAT_MODEL),
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 8,
+        },
+    )
+    if not data:
+        return None
+    try:
+        return str(data["choices"][0]["message"]["content"])
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def test_connection() -> tuple[bool, str]:
+    """连接自检：返回 (是否成功, 人类可读信息)。
+
+    - 未配置（无 Key / 显式关闭）：直接报未配置；
+    - 配了向量模型：测嵌入接口（语义搜索依赖它）；
+    - 没配向量模型（DeepSeek/Moonshot 常见）：测对话接口
+      （自动分类与 AI 分组本来就只用 chat，测它才是用户真正需要的）。
+    """
+    global _last_error
+    if not is_configured():
+        return False, "尚未配置 API Key 或 AI 已停用"
+    try:
+        embed_model = get_embed_model().strip()
+        chat_model = get_chat_model().strip()
+        if embed_model:
+            _last_error = None
+            vector = embed_text("连接测试")
+            if vector:
+                return True, f"连接成功！向量接口可用（{embed_model}，维度 {len(vector)}）"
+            return False, f"向量接口连接失败：{_last_error or '接口未返回向量'}"
+        if chat_model:
+            _last_error = None
+            if _chat_ping() is not None:
+                return True, f"连接成功！对话接口可用（{chat_model}）"
+            return False, f"对话接口连接失败：{_last_error or '接口未返回内容'}"
+        return False, "尚未配置分类模型或向量模型"
+    except Exception as exc:  # 兜底：自检本身绝不让设置窗崩掉
+        return False, f"连接出错：{exc}"
 
 
 # ---------------------------------------------------------------------------

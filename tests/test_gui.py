@@ -607,3 +607,57 @@ def test_gui_smart_search_merges_keyword_and_semantic(window, monkeypatch):
     assert content_id in ids  # 内容命中
     assert named_id in ids  # 命名命中必须出现（回归点）
     assert len(ids) == len(set(ids))  # 不重复
+
+
+def test_gui_settings_test_uses_connection_selfcheck(window, monkeypatch):
+    """「测试连接」走 ai_client.test_connection：对话接口成功也算通过。
+
+    回归：DeepSeek 无向量接口，旧实现只测 embedding 会永远误报连接失败。
+    """
+    import ai_client
+    import gui as gui_module
+    from gui import ClipVaultGUI
+
+    _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    # 不落 settings.json（避免污染其他用例），自检被 monkeypatch 成「对话接口通」
+    monkeypatch.setattr(gui_module.config, "save_settings", lambda values: None)
+    monkeypatch.setattr(ai_client, "is_configured", lambda: True)
+    monkeypatch.setattr(ai_client, "test_connection", lambda: (True, "连接成功！对话接口可用"))
+    shown: list[str] = []
+    monkeypatch.setattr(
+        gui_module.messagebox, "showinfo", lambda title, msg, parent=None: shown.append(msg)
+    )
+
+    # 测试环境没有 mainloop：把 gui 的 threading.Thread 换成同步执行器，
+    # 让后台自检在测试线程内跑完，root.after 的回调再由 window.update() 处理
+    class _SyncThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None, name=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    import threading as _real_threading
+
+    class _Shim:
+        Thread = _SyncThread
+        Event = _real_threading.Event
+
+    monkeypatch.setattr(gui_module, "threading", _Shim)
+
+    # 真实打开设置窗（_show_test_result 只在设置窗开着时才弹结果框）
+    gui.open_settings()
+    window.update()
+    assert gui._settings_win is not None
+
+    gui._settings_test(
+        gui._settings_win, gui._settings_entries, gui._settings_enabled
+    )
+    window.update()  # 处理 root.after(0, _show_test_result) 回调
+
+    gui._close_settings()
+    window.update()
+    assert shown and "对话接口可用" in shown[0]

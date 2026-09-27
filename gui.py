@@ -1782,7 +1782,12 @@ class ClipVaultGUI:
     def _settings_test(
         self, win, entries: dict[str, tk.StringVar], enabled_var: tk.BooleanVar
     ) -> None:
-        """先保存当前界面值，再后台测试一次向量接口（避免阻塞 UI）。"""
+        """先保存当前界面值，再后台做一次连接自检（避免阻塞 UI）。
+
+        自检按当前实际配置选择探测对象（见 ai_client.test_connection）：
+        配了向量模型测嵌入，没配（如 DeepSeek）测对话接口 —— 分类与分组
+        本来就只用 chat，拿 embedding 的结果判死活会误报「连接失败」。
+        """
         self._settings_save(win, entries, enabled_var)
         if not ai_client.is_configured():
             messagebox.showwarning("连接测试", "尚未配置 API Key 或 AI 已停用。", parent=win)
@@ -1791,14 +1796,10 @@ class ClipVaultGUI:
 
         def _run():
             try:
-                vector = ai_client.embed_text("连接测试")
-                if vector:
-                    message = f"连接成功！向量维度 {len(vector)}。"
-                else:
-                    message = "连接失败：请检查 API Key / 接口地址 / 网络。"
+                ok, message = ai_client.test_connection()
             except Exception as exc:
-                message = f"连接出错：{exc}"
-            self.root.after(0, self._show_test_result, message)
+                ok, message = False, f"连接出错：{exc}"
+            self.root.after(0, self._show_test_result, f"{'✅ ' if ok else '❌ '}{message}")
 
         threading.Thread(target=_run, name="clipvault-ai-test", daemon=True).start()
 

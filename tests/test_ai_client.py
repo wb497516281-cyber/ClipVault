@@ -303,3 +303,72 @@ def test_worker_skips_stale_tasks(fake_key, monkeypatch):
     ai_client._job_queue.join()
 
     assert written == []  # 旧文本的分类/向量都没有写回
+
+
+# ---------------------------------------------------------------------------
+# 连接自检（设置窗「测试连接」）
+# ---------------------------------------------------------------------------
+
+
+def test_connection_not_configured(monkeypatch):
+    """未配置：直接报未配置，不发请求。"""
+    monkeypatch.delenv(ai_client.ENV_PREFIX + "API_KEY", raising=False)
+    ok, message = ai_client.test_connection()
+    assert ok is False
+    assert "尚未配置" in message
+
+
+def test_connection_tests_embed_when_model_configured(fake_key, monkeypatch):
+    """配了向量模型：测嵌入接口，成功信息带维度与模型名。"""
+    monkeypatch.setattr(
+        ai_client,
+        "_post_json",
+        lambda *a, **k: {"data": [{"index": 0, "embedding": [0.1, 0.2, 0.3]}]},
+    )
+    ok, message = ai_client.test_connection()
+    assert ok is True
+    assert "维度 3" in message
+
+
+def test_connection_falls_back_to_chat_without_embed_model(fake_key, monkeypatch):
+    """没配向量模型（DeepSeek/Moonshot）：测对话接口——回归「永远连接失败」误报。"""
+    monkeypatch.setattr(
+        ai_client,
+        "_get_setting",
+        lambda name, default: "" if name == "EMBED_MODEL" else default,
+    )
+    monkeypatch.setattr(
+        ai_client, "_post_json", lambda *a, **k: {"choices": [{"message": {"content": "pong"}}]}
+    )
+    ok, message = ai_client.test_connection()
+    assert ok is True
+    assert "对话接口" in message
+
+
+def test_connection_chat_failure_reports_reason(fake_key, monkeypatch):
+    """对话接口也失败时给出失败信息（不抛异常）。"""
+    monkeypatch.setattr(
+        ai_client,
+        "_get_setting",
+        lambda name, default: "" if name == "EMBED_MODEL" else default,
+    )
+    monkeypatch.setattr(ai_client, "_post_json", lambda *a, **k: None)
+    ok, message = ai_client.test_connection()
+    assert ok is False
+    assert "对话接口" in message
+
+
+def test_connection_failure_includes_http_status(fake_key, monkeypatch):
+    """HTTP 错误（如 401 Key 错）要带进失败信息，用户能自己排查。"""
+    import urllib.error
+
+    def boom(*args, **kwargs):
+        raise urllib.error.HTTPError(
+            "https://api.example.com/v1/embeddings", 401, "Unauthorized", {}, None
+        )
+
+    monkeypatch.setattr(ai_client.urllib.request, "urlopen", boom)
+    ok, message = ai_client.test_connection()
+    assert ok is False
+    assert "401" in message
+    assert ai_client.last_error() is not None
