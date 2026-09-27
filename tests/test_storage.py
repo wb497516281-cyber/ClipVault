@@ -212,6 +212,30 @@ def test_list_items_keyword_search_and_escape():
     assert len(storage.list_items(q="_")) == 0  # _ 同理（没有条目含字面下划线）
 
 
+def test_list_items_search_matches_custom_title():
+    """关键词搜索必须命中自定义命名（title）：内容没关键词但名字有，也要搜得到。"""
+    named = storage.insert_item("text", content_hash="k3", text_content="sk-abc123 密钥")
+    storage.update_item_title(named, "DeepSeek 账号")
+    other = storage.insert_item("text", content_hash="k4", text_content="会议纪要")
+
+    rows = storage.list_items(q="DeepSeek")
+    assert [row["id"] for row in rows] == [named]  # 名字命中即返回
+
+    # 命名 + 内容同时命中同一个词时只算一条（DISTINCT 兜底）
+    storage.insert_item("text", content_hash="k5", text_content="DeepSeek 相关的笔记")
+    assert len(storage.list_items(q="DeepSeek")) == 2
+    assert other not in [row["id"] for row in storage.list_items(q="DeepSeek")]
+
+
+def test_list_items_search_title_for_image_items():
+    """图片条目没有文本内容，但命名同样可搜。"""
+    image_id = storage.insert_item(
+        "image", content_hash="k6", image_path="a.png", thumbnail_path="thumb_a.png"
+    )
+    storage.update_item_title(image_id, "设计稿-终版")
+    assert [row["id"] for row in storage.list_items(q="终版")] == [image_id]
+
+
 def test_list_items_type_filter():
     storage.insert_item("text", content_hash="f1", text_content="t")
     storage.insert_item(

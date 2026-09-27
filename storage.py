@@ -345,7 +345,7 @@ def list_items(
 ) -> list[dict[str, Any]]:
     """按展示顺序返回条目：置顶优先，其次按时间倒序。
 
-    q 非空时对 text_content / source_app 做 LIKE 关键词搜索；
+    q 非空时对 text_content / title（自定义命名）/ source_app 做 LIKE 关键词搜索；
     content_type 可传 'text' / 'image' 做类型过滤；
     group_id 非空时只返回该分组的成员；
     grouped 可传 'ungrouped'（只要无分组成员）/ 'grouped'（只要有分组成员）/ 'all'。
@@ -366,9 +366,15 @@ def list_items(
             "EXISTS (SELECT 1 FROM clip_group_members gm WHERE gm.item_id = i.id)"
         )
     if q:
-        conditions.append("(i.text_content LIKE ? ESCAPE '\\' OR i.source_app LIKE ? ESCAPE '\\')")
+        # 搜索范围：内容 + 自定义命名 + 来源应用。
+        # 命名是手动分组/编辑时起的名字（title），必须参与搜索 —— 否则
+        # 「搜得到内容、搜不到自己起的名」会让人以为条目丢了。
+        conditions.append(
+            "(i.text_content LIKE ? ESCAPE '\\' OR i.title LIKE ? ESCAPE '\\'"
+            " OR i.source_app LIKE ? ESCAPE '\\')"
+        )
         like = f"%{escape_like(q)}%"
-        params.extend([like, like])
+        params.extend([like, like, like])
     if content_type in ("text", "image"):
         conditions.append("i.content_type = ?")
         params.append(content_type)

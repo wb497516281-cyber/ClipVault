@@ -2,8 +2,8 @@
 
 无 Web、无浏览器：列表卡片直接画在 tkinter Canvas 上。
 功能：
-  1. 顶部搜索框（300ms 防抖）+ 类型筛选（全部/文本/图片）；
-  2. 配置 AI 后出现检索模式切换（智能/关键词/语义）；
+  1. 顶部搜索框（300ms 防抖，搜内容/自定义命名/来源应用）+ 类型筛选（全部/文本/图片）；
+  2. 配置 AI 后出现检索模式切换（智能=关键词+语义混合 / 关键词 / 语义）；
   3. 左侧分组栏：全部 / 未分组 / 我的分组（带计数），支持新建/重命名/删除；
   4. 卡片：文本显示前若干字符，图片显示缩略图；元信息含时间/来源/类型/AI 分类/分组/名称；
   5. 点击卡片 → 写回系统剪贴板（文本 CF_UNICODETEXT；图片多格式，QQ/微信可粘贴）；
@@ -177,7 +177,7 @@ class ClipVaultGUI:
         )
         search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
         search_entry.insert(0, "")
-        self._set_placeholder(search_entry, "搜索剪贴板内容或来源应用…")
+        self._set_placeholder(search_entry, "搜索剪贴板内容、命名或来源应用…")
 
         # —— 类型筛选 ——
         self.type_buttons: dict[str, tk.Button] = {}
@@ -635,7 +635,7 @@ class ClipVaultGUI:
             self.mode == "semantic" or (self.mode == "auto" and self.ai_configured)
         )
         if use_semantic:
-            self._toast("🔍 语义检索中…")
+            self._toast("🔍 检索中…")
             threading.Thread(
                 target=self._semantic_worker, args=(q,), name="clipvault-search", daemon=True
             ).start()
@@ -643,12 +643,31 @@ class ClipVaultGUI:
             self._apply_rows(self._load_items_sync(q))
 
     def _semantic_worker(self, q: str) -> None:
-        """后台语义检索：失败/无结果时降级关键词，完成后回主线程渲染。"""
+        """后台检索，完成后回主线程渲染。
+
+        - 智能模式（auto）：关键词（内容/命名/来源）命中排前，语义增量去重补后。
+          本地 LIKE 是确定性的——搜命名、搜来源一定命中；语义只做增量补充，
+          不会像纯语义那样把「明明有这个词」的条目漏掉（未建向量的老条目尤其明显）；
+        - 纯语义模式（semantic）：仅语义结果；失败/无结果时降级关键词。
+        """
         try:
-            rows = self._semantic_rows(q) or self._load_items_sync(q)
+            if self.mode == "auto":
+                rows = self._merge_smart_results(q)
+            else:
+                rows = self._semantic_rows(q) or self._load_items_sync(q)
         except Exception:
             rows = self._load_items_sync(q)
         self.root.after(0, self._apply_rows, rows)
+
+    def _merge_smart_results(self, q: str) -> list[dict]:
+        """智能检索：本地关键词（内容/命名/来源）在前，语义增量去重追加在后。"""
+        merged = self._load_items_sync(q)
+        seen = {row["id"] for row in merged}
+        for row in self._semantic_rows(q):
+            if row["id"] not in seen:
+                merged.append(row)
+                seen.add(row["id"])
+        return merged[:LIST_LIMIT]
 
     def _apply_rows(self, rows: list[dict]) -> None:
         """主线程渲染入口：数据没变（指纹一致）就跳过重绘。

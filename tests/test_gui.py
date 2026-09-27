@@ -571,3 +571,39 @@ def test_gui_fingerprint_includes_group_names(window):
     assert gui._fingerprint != before  # 分组名进了指纹，触发重绘
     row = next(r for r in gui.items if r["id"] == text_id)
     assert row["group_names"] == ["工作"]
+
+
+def test_gui_smart_search_merges_keyword_and_semantic(window, monkeypatch):
+    """智能检索：关键词（内容/命名/来源）命中排前，语义增量去重补后。
+
+    回归：命名搜索 —— 内容里没有搜索词、但自定义命名命中的条目必须出现，
+    不能只在语义结果里找（没建向量的老条目会被纯语义漏掉）。
+    """
+    import storage
+    from gui import ClipVaultGUI
+
+    # 内容命中
+    content_id = storage.insert_item(
+        "text", content_hash="ss-1", text_content="DeepSeek API 调用示例"
+    )
+    # 仅命名命中（内容无关）
+    named_id = storage.insert_item("text", content_hash="ss-2", text_content="sk-abc123")
+    storage.update_item_title(named_id, "DeepSeek 账号")
+    # 仅语义命中（关键词完全匹配不到）
+    semantic_only = storage.insert_item("text", content_hash="ss-3", text_content="大语言模型")
+
+    gui = ClipVaultGUI(window)
+    window.update()
+    gui.mode = "auto"
+    gui.ai_configured = True
+    # 只让第 3 条出现在语义结果里
+    monkeypatch.setattr(gui, "_semantic_rows", lambda q: [storage.get_item(semantic_only)])
+
+    rows = gui._merge_smart_results("DeepSeek")
+    ids = [row["id"] for row in rows]
+
+    # 两条关键词命中都在语义增量之前（块内具体顺序由置顶/时间/id 决定，无关紧要）
+    assert ids.index(named_id) < ids.index(semantic_only)
+    assert content_id in ids  # 内容命中
+    assert named_id in ids  # 命名命中必须出现（回归点）
+    assert len(ids) == len(set(ids))  # 不重复
