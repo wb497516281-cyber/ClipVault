@@ -19,7 +19,7 @@ import sqlite3
 import struct
 from collections.abc import Sequence
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -660,25 +660,31 @@ def ungrouped_text_items(limit: int = 500) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def delete_ungrouped_items() -> tuple[int, list[str]]:
+def delete_ungrouped_items(older_than_days: int | None = None) -> tuple[int, list[str]]:
     """批量清理「未分组」条目：删行 + 删向量，返回 (删除条数, 图片相对路径列表)。
 
-    策略（用户要求）：未分组内容每周清一次；入了组的条目永不自动删除
-    （置顶但未分组的一并删——置顶只是展示优先级，分组才是保留信号）。
-    图片文件由调用方按相对路径删除（本函数只动数据库，保持与
-    delete_item 一致的分工：路径解析与 IMAGE_DIR 校验在懂目录的那一层）。
+    older_than_days 非空时只删「保存超过 N 天」的——按每条自己的 created_at
+    单独算年龄（不是攒到每周统一清一批）；None 时删全部未分组（手动清理用）。
+    入了组的条目永不删（分组是「收藏夹」，是保留信号）。
+    图片文件由调用方按相对路径删除（本函数只动数据库）。
     """
+    cutoff: str | None = None
+    if older_than_days is not None:
+        cutoff = (datetime.now() - timedelta(days=older_than_days)).strftime("%Y-%m-%d %H:%M:%S")
     with closing(get_connection()) as conn:
         with conn:  # 单事务：行与向量要么全删要么都不删
-            rows = conn.execute(
-                """
+            sql = """
                 SELECT i.id, i.image_path, i.thumbnail_path
                 FROM clipboard_items i
                 WHERE NOT EXISTS (
                     SELECT 1 FROM clip_group_members m WHERE m.item_id = i.id
                 )
-                """
-            ).fetchall()
+            """
+            params: list[Any] = []
+            if cutoff is not None:
+                sql += " AND i.created_at <= ?"
+                params.append(cutoff)
+            rows = conn.execute(sql, tuple(params)).fetchall()
             if not rows:
                 return 0, []
             ids = [int(row["id"]) for row in rows]

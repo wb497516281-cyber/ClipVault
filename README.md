@@ -8,7 +8,7 @@
 
 - 🔄 **后台自动采集**：0.5 秒轮询剪贴板，文本和图片（复制/截图）自动入库
 - 🗂️ **分组（AI + 手动）**：左侧分组栏把历史按项目/类型归拢；悬停卡片点「分组」勾选加入（可多选）、现场新建；「AI 自动分组」后台分批把未分组条目交给分类模型归组（优先复用现有分组，缺了就新建），单条还能让 AI 建议去哪组
-- 🧹 **历史上限清理**：**未分组内容每周自动清理一次，分组内容永久保留**；分组栏「🧹 清理未分组」可随时手动触发（二次确认，展示将删条数与下次自动清理时间）
+- 🧹 **历史上限清理**：**未分组内容按每条保存时间单独算，满 7 天自动删；分组内容永久保留**；分组栏「🧹 清理未分组」可立即手动清空全部未分组（二次确认）
 - 📦 **数据独立存放**：打包版数据放 `%LOCALAPPDATA%\ClipVault\data`（exe 外面），重新打包/覆盖更新都不碰它；旧版数据首次启动自动迁移
 - 🔆 **自动更新**（打包版）：启动后台检查 GitHub Release，有新版本就下载，确认后重启热替换；托盘菜单也可手动「检查更新」
 - 🖼️ **图片完整留存**：原图 + 200×200 缩略图存 `clipboard_data/images/`，数据库只存相对路径（**绝不存 BLOB**）
@@ -45,7 +45,7 @@ clipvault/
 ├── storage.py           # SQLite 存储层：建表/迁移/插入/去重/列表搜索/置顶/删除/分组/向量
 ├── watcher.py           # 剪贴板采集主循环（0.5s 轮询、图片优先、独占重试）
 ├── ai_client.py         # 可选 AI：分类/向量化/智能分组/余弦相似度/后台队列（未配置自动降级）
-├── cleanup.py           # 历史上限清理：未分组内容每周自动清（分组永久保留）+ 手动清理
+├── cleanup.py           # 历史上限清理：未分组满 N 天按每条保存年龄删（分组永久保留）+ 手动清空
 ├── updater.py           # 自动更新：检查 GitHub Release / 后台下载 / 重启热替换（仅打包版）
 ├── config.py            # 配置：.env 加载 + CLIPVAULT_* 环境变量 + 数据目录策略（打包版 %LOCALAPPDATA%）
 ├── tray.py              # 托盘常驻版（采集 + GUI 一体，需 pystray）
@@ -139,7 +139,7 @@ python autostart.py remove     # 移除
 | **分组浏览** | 左栏点分组名 / 「未分组」，只看该组内容 |
 | **手动分组** | 悬停卡片 → 「分组」→ 勾选加入/移出（可多选）、＋新建分组、✨AI 建议本条去哪组 |
 | **AI 自动分组** | 左栏「🤖 AI 自动分组」（或托盘菜单）：后台把未分组条目分批交给分类模型归组，跑完汇报新建几个组、入组几条 |
-| **🧹 清理未分组** | 左栏「🧹 清理未分组」按钮：二次确认后立即清理；**每周也会自动清理一次**（未分组删、分组留） |
+| **🧹 清理未分组** | 左栏「🧹 清理未分组」按钮：二次确认后立即清空全部未分组；自动规则=未分组满 7 天按每条保存时间单独删 |
 | 分组管理 | 左栏右键分组 → 重命名 / 删除（删组不删条目）；底部「＋ 新建分组」|
 | 配置 AI | 顶栏「AI 设置」按钮（托盘模式也可从托盘菜单进入）|
 | 自动更新 | 启动时自动检查；有新版本弹窗确认后重启热替换；托盘菜单「检查更新…」可手动触发 |
@@ -191,7 +191,7 @@ python autostart.py remove     # 移除
 - **数据库**：`clipboard_data/clipboard.db`，WAL 模式，采集线程写、界面读并发不阻塞
 - **数据目录位置**：打包版在 `%LOCALAPPDATA%\ClipVault\data`（exe 外面，重建/覆盖更新都不碰它，旧版 exe 旁的数据首次启动自动迁移）；源码版在 `<项目根>/clipboard_data`；`CLIPVAULT_DATA_DIR` 可强制指定
 - **AI 设置**：`clipboard_data/settings.json`（界面「AI 设置」保存的 API 配置，仅存本机，已被 gitignore）
-- **清理状态**：`clipboard_data/cleanup_state.json`（记录上次清理时间与删除条数；**不放 settings.json**——那个文件由 AI 设置窗整体覆写会被冲掉）
+- **清理状态**：`clipboard_data/cleanup_state.json`（记录上次自动清理运行时间与删除条数，仅诊断用；**不放 settings.json**——那个文件由 AI 设置窗整体覆写会被冲掉）
 - **图片**：`clipboard_data/images/` 下原图 + `thumb_` 前缀缩略图；数据库只存**相对数据目录**的路径（如 `images/thumb_xxx.png`），数据目录整体搬家后路径依然有效
 - **去重**：`content_hash` 字段带 UNIQUE 约束；`watcher.last_hash` 记忆最近一次内容，双重保险
 - **语义向量**：`clip_vectors` 表，float32 小端 BLOB（**是文本向量，不是图片**；图片仍然只存路径）
@@ -225,7 +225,7 @@ clip_group_members(group_id, item_id, added_at, PRIMARY KEY(group_id, item_id))
 | 配置项 | 位置 / 变量 | 默认 |
 |---|---|---|
 | 数据目录 | `CLIPVAULT_DATA_DIR` | 打包版 `%LOCALAPPDATA%\ClipVault\data`；源码版 `<项目根>/clipboard_data` |
-| 未分组清理周期 | `CLIPVAULT_CLEANUP_DAYS` | 7 天（每周） |
+| 未分组保留天数 | `CLIPVAULT_CLEANUP_DAYS` | 7 天（每条按自己的保存时间单独算，不是统一清一批） |
 | 轮询间隔 | `watcher.py` → `POLL_INTERVAL` | 0.5 秒 |
 | 剪贴板重试 | `watcher.py` → `OPEN_RETRIES`/`OPEN_RETRY_DELAY` | 3 次 × 50ms |
 | 缩略图尺寸 | `watcher.py` → `THUMBNAIL_SIZE` | 200×200 |

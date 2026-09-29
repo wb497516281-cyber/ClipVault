@@ -731,7 +731,7 @@ def test_gui_auto_cleanup_hook_refreshes_on_delete(window, monkeypatch):
     gui._maybe_auto_cleanup()
     window.update()
     assert gui._fingerprint != "sentinel"
-    assert "每周清理" in gui.toast_var.get()
+    assert "自动清理" in gui.toast_var.get()
 
 
 # ---------------------------------------------------------------------------

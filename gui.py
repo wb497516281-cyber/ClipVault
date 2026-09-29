@@ -10,7 +10,7 @@
   6. 悬停卡片出现「分组 / 置顶 / 编辑 / 删除」按钮；删除两步确认；
   7. 「分组」按钮弹出成员菜单：勾选加入/移出分组、现场新建分组、✨AI 建议本条去哪组；
   8. 分组栏「AI 自动分组」：后台把未分组条目分批交给分类模型归组（未配置 AI 自动降级）；
-  9. 🧹 历史上限：未分组内容每周自动清理一次（分组内容永久保留），分组栏「清理未分组」可手动触发；
+  9. 🧹 历史上限：未分组内容按每条保存时间单独算，满 N 天（默认 7）自动删，分组内容永久保留；分组栏「清理未分组」可立即手动清；
   10. 🔆 自动更新（打包版）：启动后台检查 GitHub Release，有新版本就下载，确认后重启热替换；
   11. 置顶条目排最前且不同底色 + 左侧强调条；
   12. 每 5 秒自动刷新（数据没变不重绘，不闪）；剪贴板采集在后台线程运行；
@@ -145,9 +145,6 @@ class ClipVaultGUI:
         self.group_id: int | None = None  # 当前查看的分组（None = 不在具体分组视图）
         self.show_ungrouped: bool = False  # 当前是否查看「未分组」
         self._group_menu_win: tk.Toplevel | None = None  # 卡片「分组」成员菜单
-
-        # 升级首启兜底：登记清理时钟（没有状态文件时 7 天后才第一次真删）
-        cleanup.ensure_state()
 
         self._build_widgets()
         self._load_and_render()
@@ -574,7 +571,7 @@ class ClipVaultGUI:
     # ------------------------------------------------------------------
 
     def _cleanup_clicked(self) -> None:
-        """手动清理未分组条目（二次确认，告知将删条数与下次自动清理时间）。"""
+        """手动清理未分组条目（二次确认，告知将删条数与自动清理规则）。"""
         overview = storage.group_overview()
         pending = overview["ungrouped"]
         if pending <= 0:
@@ -582,14 +579,14 @@ class ClipVaultGUI:
             return
         confirmed = messagebox.askyesno(
             "清理未分组",
-            f"将永久删除 {pending} 条未分组记录（含图片与语义向量），"
+            f"将立即删除全部 {pending} 条未分组记录（含图片与语义向量），"
             f"已入组的 {overview['total'] - pending} 条不受影响。\n"
-            f"{cleanup.next_cleanup_text()}\n确定现在清理吗？",
+            f"{cleanup.rule_text()}\n确定现在清理吗？",
             parent=self.root,
         )
         if not confirmed:
             return
-        result = cleanup.run_cleanup(force=True)
+        result = cleanup.run_manual()
         if result["deleted"] > 0:
             self._group_sig = None
             self._fingerprint = None
@@ -599,13 +596,13 @@ class ClipVaultGUI:
             self._toast("清理完成，没有可删的条目")
 
     def _maybe_auto_cleanup(self) -> None:
-        """自动清理钩子（刷新链路调用）：到期才真删，删过就刷新界面 + toast。"""
+        """自动清理钩子（刷新链路调用）：删了才刷新界面 + toast。"""
         result = cleanup.maybe_run()
         if result and result.get("deleted", 0) > 0:
             self._group_sig = None
             self._fingerprint = None
             self._load_and_render()
-            self._toast(f"🧹 每周清理：已删除 {result['deleted']} 条未分组记录")
+            self._toast(f"🧹 自动清理：已删除 {result['deleted']} 条过期未分组记录")
 
     # ------------------------------------------------------------------
     # 数据加载（关键词 + 语义混合 + 分组过滤）
