@@ -882,3 +882,166 @@ def test_gui_update_check_no_new_version_manual(window, monkeypatch):
     gui.start_update_check(manual=True)
     window.update()
     assert "已是最新版本" in gui.toast_var.get()
+
+
+# ---------------------------------------------------------------------------
+# 交互改造：三行预览 / 单击打开 / 双击复制 / 右键菜单 / 详情窗
+# ---------------------------------------------------------------------------
+
+
+def test_card_preview_capped_at_three_lines():
+    """卡片预览最多 3 行：多余的隐藏，打开详情窗才看全。"""
+    from gui import MAX_CARD_LINES, _build_preview
+
+    assert MAX_CARD_LINES == 3
+    text = "\n".join(f"第{i}行内容" for i in range(30))
+    preview, lines = _build_preview(text, 600)
+    assert lines == 3
+    assert preview.count("\n") + 1 == 3
+    assert preview.endswith(" …")
+
+
+def test_gui_single_click_schedules_open_double_click_cancels(window, monkeypatch):
+    """单击卡片 = 延迟打开（定时器挂上）；双击 = 取消打开并复制。"""
+    from gui import ClipVaultGUI
+
+    _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    first_id = gui.items[0]["id"]
+    cx, cy, cw, ch = gui._card_rects[first_id]
+
+    class _Evt:
+        def __init__(self, x, y):
+            self.x, self.y = x, y
+
+    opened: list[int] = []
+    copied: list[int] = []
+    monkeypatch.setattr(gui, "open_detail", lambda i: opened.append(i))
+    monkeypatch.setattr(gui, "_copy_item", lambda i: copied.append(i))
+
+    # 单击卡片本体：只安排延迟，不立即打开、更不复制
+    gui._on_click(_Evt(cx + 30, cy + ch - 12))
+    assert gui._pending_open_timer is not None
+    assert opened == [] and copied == []
+
+    # 双击赶到：取消待执行的打开，改为复制
+    gui._on_double_click(_Evt(cx + 30, cy + ch - 12))
+    assert gui._pending_open_timer is None
+    assert opened == []  # 没有弹开详情窗
+    assert copied == [first_id]
+
+
+def test_gui_single_click_on_action_button_opens_nothing(window, monkeypatch):
+    """点在悬停按钮上：按钮自己的动作，不走「单击打开」逻辑。"""
+    from gui import ClipVaultGUI
+
+    _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    first_id = gui.items[0]["id"]
+    gui.hovered_id = first_id
+    gui._render()
+    window.update()
+    cx, cy, cw, ch = gui._card_rects[first_id]
+
+    class _Evt:
+        def __init__(self, x, y):
+            self.x, self.y = x, y
+
+    opened: list[int] = []
+    monkeypatch.setattr(gui, "open_detail", lambda i: opened.append(i))
+    # 编辑按钮坐标（分组|置顶|编辑|删除 的第三个）
+    btn_w, gap = 52, 6
+    bx3 = cx + cw - btn_w * 4 - gap * 3 - 8 + (btn_w + gap) * 2
+    gui._on_click(_Evt(bx3 + btn_w // 2, cy + 8 + 13))
+
+    assert gui._pending_open_timer is None  # 没安排延迟打开
+    assert opened == []
+    assert gui._editor_win is not None  # 走的是编辑按钮
+    gui._close_editor()
+    window.update()
+
+
+def test_gui_detail_window_shows_full_text(window):
+    """详情窗：卡片只给 3 行，详情窗给全文（可滚动）。"""
+    import tkinter as tk
+
+    import gui as gui_module
+    import storage
+    from gui import MAX_CARD_LINES, ClipVaultGUI
+
+    long_text = "\n".join(f"第 {i} 行：一些内容内容内容" for i in range(30))
+    item_id = storage.insert_item(
+        "text", content_hash="detail-1", text_content=long_text, source_app="Notepad"
+    )
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    # 卡片预览只有 3 行
+    _, lines = gui_module._build_preview(long_text, 600)
+    assert lines == MAX_CARD_LINES
+
+    gui.open_detail(item_id)
+    window.update()
+    win = gui._detail_wins.get(item_id)
+    assert win is not None and win.winfo_exists()
+
+    # 详情窗里的文本框是全文（30 行一行不少）
+    text_box = None
+    for child in win.winfo_children():
+        for sub in child.winfo_children():
+            if isinstance(sub, tk.Text):
+                text_box = sub
+    assert text_box is not None
+    content = text_box.get("1.0", tk.END)
+    assert content.count("\n") >= 30
+    assert "第 29 行" in content
+
+    # 重复打开是提窗，不重开
+    gui.open_detail(item_id)
+    assert gui._detail_wins[item_id] is win
+
+    gui._close_detail(item_id)
+    window.update()
+    assert item_id not in gui._detail_wins
+
+
+def test_gui_context_menu_has_all_actions(window):
+    """右键菜单：打开/复制/置顶/编辑/分组/删除 六项齐全。"""
+    import storage
+    from gui import ClipVaultGUI
+
+    _, text_id, _ = _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    menu = gui._build_context_menu(text_id, storage.get_item(text_id))
+    labels = []
+    for i in range(menu.index("end") + 1):
+        if menu.type(i) == "separator":
+            continue
+        labels.append(menu.entrycget(i, "label"))
+    assert labels == ["打开", "复制", "置顶", "编辑", "分组", "删除"]
+    menu.destroy()
+
+
+def test_gui_context_menu_pinned_label_flips(window):
+    """已置顶条目：右键菜单的置顶项变「取消置顶」。"""
+    import storage
+    from gui import ClipVaultGUI
+
+    _, text_id, pinned_id = _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    menu = gui._build_context_menu(pinned_id, storage.get_item(pinned_id))
+    labels = []
+    for i in range(menu.index("end") + 1):
+        if menu.type(i) == "separator":
+            continue
+        labels.append(menu.entrycget(i, "label"))
+    assert labels[2] == "取消置顶"  # 第三项动作从「置顶」翻面
+    menu.destroy()

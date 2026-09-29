@@ -5,16 +5,18 @@
   1. 顶部搜索框（300ms 防抖，搜内容/自定义命名/来源应用）+ 类型筛选（全部/文本/图片）；
   2. 配置 AI 后出现检索模式切换（智能=关键词+语义混合 / 关键词 / 语义）；
   3. 左侧分组栏：全部 / 未分组 / 我的分组（带计数），支持新建/重命名/删除；
-  4. 卡片：文本显示前若干字符，图片显示缩略图；元信息含时间/来源/类型/AI 分类/分组/名称；
-  5. 点击卡片 → 写回系统剪贴板（文本 CF_UNICODETEXT；图片多格式，QQ/微信可粘贴）；
-  6. 悬停卡片出现「分组 / 置顶 / 编辑 / 删除」按钮；删除两步确认；
-  7. 「分组」按钮弹出成员菜单：勾选加入/移出分组、现场新建分组、✨AI 建议本条去哪组；
-  8. 分组栏「AI 自动分组」：后台把未分组条目分批交给分类模型归组（未配置 AI 自动降级）；
-  9. 🧹 历史上限：未分组内容按每条保存时间单独算，满 N 天（默认 7）自动删，分组内容永久保留；分组栏「清理未分组」可立即手动清；
-  10. 🔆 自动更新（打包版）：启动后台检查 GitHub Release，有新版本就下载，确认后重启热替换；
-  11. 置顶条目排最前且不同底色 + 左侧强调条；
-  12. 每 5 秒自动刷新（数据没变不重绘，不闪）；剪贴板采集在后台线程运行；
-  13. 语义检索走后台线程 + 查询向量缓存，接口慢不冻结界面。
+  4. 卡片：文本最多显示 3 行预览（超出截断），图片显示缩略图；元信息含时间/来源/类型/AI 分类/分组/名称；
+  5. 左键单击卡片 → 打开详情窗（文本全文/图片原图，带复制按钮）；
+  6. 左键双击卡片 → 写回系统剪贴板（文本 CF_UNICODETEXT；图片多格式，QQ/微信可粘贴）；
+  7. 右键卡片 → 操作菜单（打开/复制/置顶/编辑/分组/删除）；
+  8. 悬停卡片出现「分组 / 置顶 / 编辑 / 删除」按钮；删除两步确认；
+  9. 「分组」按钮弹出成员菜单：勾选加入/移出分组、现场新建分组、✨AI 建议本条去哪组；
+  10. 分组栏「AI 自动分组」：后台把未分组条目分批交给分类模型归组（未配置 AI 自动降级）；
+  11. 🧹 历史上限：未分组内容按每条保存时间单独算，满 N 天（默认 7）自动删，分组内容永久保留；分组栏「清理未分组」可立即手动清；
+  12. 🔆 自动更新（打包版）：启动后台检查 GitHub Release，有新版本就下载，确认后重启热替换；
+  13. 置顶条目排最前且不同底色 + 左侧强调条；
+  14. 每 5 秒自动刷新（数据没变不重绘，不闪）；剪贴板采集在后台线程运行；
+  15. 语义检索走后台线程 + 查询向量缓存，接口慢不冻结界面。
 
 运行：python gui.py            （默认同时启动采集器）
       python gui.py --no-watch （只看界面，不采集）
@@ -64,7 +66,11 @@ DELETE_CONFIRM_MS = 3000
 LIST_LIMIT = 200
 
 #: 文本卡片最多渲染几行预览（超过截断加省略号，防止长文本把卡片撑爆）
-MAX_CARD_LINES = 8
+MAX_CARD_LINES = 3
+
+#: 单击「打开」的延迟（毫秒）：取系统双击间隔 + 余量，
+#: 保证双击的第二下能赶在打开之前取消它（否则双击复制会顺带弹开详情窗）
+OPEN_DELAY_FALLBACK_MS = 600
 
 #: 主题色（深色）
 C_BG = "#15181d"  # 窗口底
@@ -179,6 +185,8 @@ class ClipVaultGUI:
         self.group_id: int | None = None  # 当前查看的分组（None = 不在具体分组视图）
         self.show_ungrouped: bool = False  # 当前是否查看「未分组」
         self._group_menu_win: tk.Toplevel | None = None  # 卡片「分组」成员菜单
+        self._pending_open_timer: str | None = None  # 单击「打开」的延迟定时器
+        self._detail_wins: dict[int, tk.Toplevel] = {}  # 已打开的详情窗（item_id -> 窗）
 
         self._build_widgets()
         self._load_and_render()
@@ -288,8 +296,10 @@ class ClipVaultGUI:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # 画布事件：点击 / 悬停 / 滚轮 / 尺寸变化
+        # 画布事件：点击 / 双击 / 右键 / 悬停 / 滚轮 / 尺寸变化
         self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind("<Double-Button-1>", self._on_double_click)
+        self.canvas.bind("<Button-3>", self._on_right_click)
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<Configure>", self._on_canvas_resize)
@@ -1086,6 +1096,7 @@ class ClipVaultGUI:
         return (None, None)
 
     def _on_click(self, event) -> None:
+        """左键分发：悬停按钮即时生效；卡片本体单击 = 延迟打开（双击可取消）。"""
         kind, item_id = self._hit_test(event)
         if kind == "action:group" and item_id is not None:
             self._open_group_menu(event, item_id)
@@ -1096,7 +1107,258 @@ class ClipVaultGUI:
         elif kind == "action:del" and item_id is not None:
             self._handle_delete_click(item_id)
         elif kind == "card" and item_id is not None:
+            self._schedule_open(item_id)
+
+    def _on_double_click(self, event) -> None:
+        """左键双击卡片 = 复制到剪贴板（同时取消单击安排的「打开」）。"""
+        self._cancel_scheduled_open()
+        kind, item_id = self._hit_test(event)
+        if kind == "card" and item_id is not None:
             self._copy_item(item_id)
+
+    def _on_right_click(self, event) -> None:
+        """右键卡片 = 弹出操作菜单（打开/复制/置顶/编辑/分组/删除）。"""
+        kind, item_id = self._hit_test(event)
+        if item_id is None:
+            return
+        item = storage.get_item(item_id)
+        if item is None:
+            return
+        menu = self._build_context_menu(item_id, item)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _build_context_menu(self, item_id: int, item: dict) -> tk.Menu:
+        """构建右键菜单（单独成方法，方便测试驱动）。"""
+        pinned = bool(item["is_pinned"])
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="打开", command=lambda: self.open_detail(item_id))
+        menu.add_command(label="复制", command=lambda: self._copy_item(item_id))
+        menu.add_separator()
+        menu.add_command(
+            label="取消置顶" if pinned else "置顶",
+            command=lambda: self._toggle_pin(item_id),
+        )
+        menu.add_command(label="编辑", command=lambda: self.open_editor(item_id))
+        menu.add_command(
+            label="分组",
+            command=lambda e=None, i=item_id: self._open_group_menu_at(i),
+        )
+        menu.add_separator()
+        menu.add_command(label="删除", command=lambda: self._confirm_delete(item_id))
+        return menu
+
+    def _open_group_menu_at(self, item_id: int) -> None:
+        """从右键菜单打开分组成员菜单（没有事件对象，用窗口中央偏上定位）。"""
+        x = self.root.winfo_rootx() + self.root.winfo_width() // 3
+        y = self.root.winfo_rooty() + 80
+
+        class _Evt:
+            x_root, y_root = x, y
+
+        self._open_group_menu(_Evt(), item_id)
+
+    def _confirm_delete(self, item_id: int) -> None:
+        """右键菜单的删除：弹窗确认后直接删（不走悬停按钮的两步确认）。"""
+        if not messagebox.askyesno("删除条目", "确定删除这条记录吗？（图片会连文件一起删）", parent=self.root):
+            return
+        self._delete_item(item_id)
+
+    # ------------------------------------------------------------------
+    # 单击「打开」的延迟调度（与双击复制共存的关键）
+    # ------------------------------------------------------------------
+
+    def _double_click_interval_ms(self) -> int:
+        """系统双击间隔 + 余量：单击打开要等过整个双击窗口期。"""
+        try:
+            import ctypes
+
+            return int(ctypes.windll.user32.GetDoubleClickTime()) + 100
+        except Exception:
+            return OPEN_DELAY_FALLBACK_MS
+
+    def _schedule_open(self, item_id: int) -> None:
+        """安排延迟打开；期间若来双击，_on_double_click 会取消它。"""
+        self._cancel_scheduled_open()
+        self._pending_open_timer = self.root.after(
+            self._double_click_interval_ms(), lambda: self.open_detail(item_id)
+        )
+
+    def _cancel_scheduled_open(self) -> None:
+        """取消待执行的单击打开（双击复制/重复单击时调用）。"""
+        if getattr(self, "_pending_open_timer", None) is not None:
+            try:
+                self.root.after_cancel(self._pending_open_timer)
+            except Exception:
+                pass
+            self._pending_open_timer = None
+
+    # ------------------------------------------------------------------
+    # 条目详情窗：单击卡片打开，文本显示全文、图片显示原图
+    # ------------------------------------------------------------------
+
+    def open_detail(self, item_id: int) -> None:
+        """打开条目详情窗：文本给全文（可滚动、可选中复制），图片给原图。
+
+        同一条目重复打开是提到最前，不重复开窗；卡片预览只给 3 行，
+        看完整内容就在这里。
+        """
+        item = storage.get_item(item_id)
+        if item is None:
+            return
+        # 模态互斥：设置窗/编辑窗开着时先提前面，避免两个模态窗抢 grab
+        if getattr(self, "_settings_win", None) is not None:
+            self._settings_win.lift()
+            self._settings_win.focus_set()
+            self._toast("请先关闭 AI 设置窗")
+            return
+        if getattr(self, "_editor_win", None) is not None:
+            self._editor_win.lift()
+            self._editor_win.focus_set()
+            self._toast("请先关闭编辑窗")
+            return
+        existing = self._detail_wins.get(item_id)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_set()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("条目详情")
+        win.configure(bg=C_BG)
+        win.transient(self.root)
+        self._detail_wins[item_id] = win
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_detail(item_id))
+
+        # —— 顶部 meta 信息（时间/来源/分类/分组/命名） ——
+        group_names = storage.group_names_by_ids([item_id]).get(item_id, [])
+        meta_parts = [
+            f"{'图片' if item['content_type'] == 'image' else '文本'}",
+            f"{item['created_at']}",
+            f"来源：{item.get('source_app') or '未知'}",
+        ]
+        if item.get("category"):
+            meta_parts.append(f"分类：{item['category']}")
+        if group_names:
+            meta_parts.append("分组：" + "、".join(group_names))
+        if item.get("title"):
+            meta_parts.append(f"命名：{item['title']}")
+        tk.Label(
+            win,
+            text=" · ".join(meta_parts),
+            bg=C_BG,
+            fg=C_DIM,
+            font=("Microsoft YaHei UI", 9),
+            wraplength=680,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, padx=12, pady=(12, 6))
+
+        # —— 内容区 ——
+        if item["content_type"] == "image":
+            self._detail_show_image(win, item)
+        else:
+            self._detail_show_text(win, item)
+
+        # —— 底部按钮 ——
+        btn_row = tk.Frame(win, bg=C_BG)
+        btn_row.pack(fill=tk.X, padx=12, pady=(0, 12))
+        tk.Button(
+            btn_row,
+            text="复制",
+            command=lambda: self._copy_item(item_id),
+            bg=C_ACCENT,
+            fg="#ffffff",
+            activebackground=C_CARD_HOVER,
+            activeforeground=C_TEXT,
+            relief=tk.FLAT,
+            font=("Microsoft YaHei UI", 10),
+            padx=14,
+            pady=3,
+            cursor="hand2",
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+        tk.Button(
+            btn_row,
+            text="关闭",
+            command=lambda: self._close_detail(item_id),
+            bg=C_CARD,
+            fg=C_TEXT,
+            activebackground=C_CARD_HOVER,
+            activeforeground=C_TEXT,
+            relief=tk.FLAT,
+            font=("Microsoft YaHei UI", 10),
+            padx=14,
+            pady=3,
+            cursor="hand2",
+        ).pack(side=tk.RIGHT)
+        win.focus_set()
+
+    def _detail_show_text(self, win: tk.Toplevel, item: dict) -> None:
+        """详情窗文本区：全文 + 滚动条（normal 状态，可选中手动 Ctrl+C）。"""
+        frame = tk.Frame(win, bg=C_BG)
+        frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+        text_box = tk.Text(
+            frame,
+            bg=C_CARD,
+            fg=C_TEXT,
+            insertbackground=C_TEXT,
+            highlightbackground=C_BORDER,
+            highlightcolor=C_ACCENT,
+            highlightthickness=1,
+            relief=tk.FLAT,
+            font=("Microsoft YaHei UI", 10),
+            wrap=tk.WORD,
+        )
+        scrollbar = tk.Scrollbar(frame, orient=tk.VERTICAL, command=text_box.yview)
+        text_box.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        text_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        text_box.insert("1.0", item.get("text_content") or "")
+        # 视图滚到最上面（长文本默认看开头）
+        text_box.see("1.0")
+        # 窗口大小按内容行数给个合理初值
+        lines = (item.get("text_content") or "").count("\n") + 1
+        height = min(max(12, lines + 3), 40)
+        win.geometry(f"760x{min(height * 18 + 130, 760)}")
+
+    def _detail_show_image(self, win: tk.Toplevel, item: dict) -> None:
+        """详情窗图片区：原图等比缩放（最大 900x620），文件缺失给占位提示。"""
+        rel = item.get("image_path")
+        path = (storage.DATA_DIR / rel).resolve() if rel else None
+        if path is None or not path.is_file():
+            tk.Label(
+                win, text="图片文件不存在（可能已被清理）", bg=C_BG, fg=C_DIM,
+                font=("Microsoft YaHei UI", 11),
+            ).pack(expand=True, pady=40)
+            win.geometry("420x200")
+            return
+        try:
+            from PIL import Image, ImageTk
+
+            with Image.open(path) as im:
+                im = im.convert("RGB")
+                im.thumbnail((900, 620))
+                photo = ImageTk.PhotoImage(im)
+            # PhotoImage 引用挂窗口上，防止被 GC 后变空白
+            win._clipvault_img_ref = photo  # noqa: SLF001
+            tk.Label(win, image=photo, bg=C_BG).pack(expand=True, padx=12, pady=4)
+            win.geometry(f"{min(im.width + 40, 940)}x{min(im.height + 150, 760)}")
+        except Exception:
+            tk.Label(
+                win, text="图片加载失败", bg=C_BG, fg=C_DIM,
+                font=("Microsoft YaHei UI", 11),
+            ).pack(expand=True, pady=40)
+            win.geometry("420x200")
+
+    def _close_detail(self, item_id: int) -> None:
+        """关闭详情窗（从登记表移除，让下次能重开）。"""
+        win = self._detail_wins.pop(item_id, None)
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
 
     def _on_motion(self, event) -> None:
         """悬停高亮：只在其变化时重绘，避免拖动鼠标疯狂重画。"""
@@ -2115,7 +2377,12 @@ class ClipVaultGUI:
     def stop_refresh(self) -> None:
         """停止自动刷新链路与待触发的定时器（窗口复用/拆卸时调用）。"""
         self._refresh_stopped = True
-        for attr in ("_pending_delete_timer", "_search_timer", "_toast_timer"):
+        for attr in (
+            "_pending_delete_timer",
+            "_search_timer",
+            "_toast_timer",
+            "_pending_open_timer",
+        ):
             timer = getattr(self, attr, None)
             if timer is not None:
                 try:
@@ -2124,6 +2391,8 @@ class ClipVaultGUI:
                     pass
                 setattr(self, attr, None)
         self._close_group_menu()  # 拆卸窗口时顺手收起模态菜单，释放 grab
+        for item_id in list(getattr(self, "_detail_wins", {})):
+            self._close_detail(item_id)
 
     def _schedule_refresh(self) -> None:
         """每 5 秒拉一次数据；指纹不变不重绘（不闪）。
