@@ -10,9 +10,10 @@
   6. 悬停卡片出现「分组 / 置顶 / 编辑 / 删除」按钮；删除两步确认；
   7. 「分组」按钮弹出成员菜单：勾选加入/移出分组、现场新建分组、✨AI 建议本条去哪组；
   8. 分组栏「AI 自动分组」：后台把未分组条目分批交给分类模型归组（未配置 AI 自动降级）；
-  9. 置顶条目排最前且不同底色 + 左侧强调条；
-  10. 每 5 秒自动刷新（数据没变不重绘，不闪）；剪贴板采集在后台线程运行；
-  11. 语义检索走后台线程 + 查询向量缓存，接口慢不冻结界面。
+  9. 🧹 历史上限：未分组内容每周自动清理一次（分组内容永久保留），分组栏「清理未分组」可手动触发；
+  10. 置顶条目排最前且不同底色 + 左侧强调条；
+  11. 每 5 秒自动刷新（数据没变不重绘，不闪）；剪贴板采集在后台线程运行；
+  12. 语义检索走后台线程 + 查询向量缓存，接口慢不冻结界面。
 
 运行：python gui.py            （默认同时启动采集器）
       python gui.py --no-watch （只看界面，不采集）
@@ -37,6 +38,7 @@ except ImportError:  # 非 Windows / 精简 Python 环境
     ttk = None  # type: ignore[assignment]
 
 import ai_client
+import cleanup
 import clipwriter
 import config
 import storage
@@ -140,6 +142,9 @@ class ClipVaultGUI:
         self.group_id: int | None = None  # 当前查看的分组（None = 不在具体分组视图）
         self.show_ungrouped: bool = False  # 当前是否查看「未分组」
         self._group_menu_win: tk.Toplevel | None = None  # 卡片「分组」成员菜单
+
+        # 升级首启兜底：登记清理时钟（没有状态文件时 7 天后才第一次真删）
+        cleanup.ensure_state()
 
         self._build_widgets()
         self._load_and_render()
@@ -330,6 +335,24 @@ class ClipVaultGUI:
             cursor="hand2",
         )
         new_group_btn.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=8)
+
+        # —— 手动清理未分组（沉底，在新建分组上方） ——
+        cleanup_btn = tk.Button(
+            self.sidebar,
+            text="🧹 清理未分组",
+            command=self._cleanup_clicked,
+            bg=C_CARD,
+            fg=C_TEXT,
+            activebackground=C_CARD_HOVER,
+            activeforeground=C_TEXT,
+            relief=tk.FLAT,
+            font=("Microsoft YaHei UI", 10),
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
+        cleanup_btn.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 4))
+        self.cleanup_btn = cleanup_btn
 
         # —— 标题 ——
         tk.Label(
@@ -542,6 +565,44 @@ class ClipVaultGUI:
         self._toast(f"🗑 已删除分组「{group['name']}」")
         self._fingerprint = None
         self._load_and_render()
+
+    # ------------------------------------------------------------------
+    # 历史上限：未分组内容每周自动清理 + 手动清理
+    # ------------------------------------------------------------------
+
+    def _cleanup_clicked(self) -> None:
+        """手动清理未分组条目（二次确认，告知将删条数与下次自动清理时间）。"""
+        overview = storage.group_overview()
+        pending = overview["ungrouped"]
+        if pending <= 0:
+            self._toast("没有未分组的条目，无需清理")
+            return
+        confirmed = messagebox.askyesno(
+            "清理未分组",
+            f"将永久删除 {pending} 条未分组记录（含图片与语义向量），"
+            f"已入组的 {overview['total'] - pending} 条不受影响。\n"
+            f"{cleanup.next_cleanup_text()}\n确定现在清理吗？",
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+        result = cleanup.run_cleanup(force=True)
+        if result["deleted"] > 0:
+            self._group_sig = None
+            self._fingerprint = None
+            self._load_and_render()
+            self._toast(f"🧹 已清理 {result['deleted']} 条未分组记录")
+        else:
+            self._toast("清理完成，没有可删的条目")
+
+    def _maybe_auto_cleanup(self) -> None:
+        """自动清理钩子（刷新链路调用）：到期才真删，删过就刷新界面 + toast。"""
+        result = cleanup.maybe_run()
+        if result and result.get("deleted", 0) > 0:
+            self._group_sig = None
+            self._fingerprint = None
+            self._load_and_render()
+            self._toast(f"🧹 每周清理：已删除 {result['deleted']} 条未分组记录")
 
     # ------------------------------------------------------------------
     # 数据加载（关键词 + 语义混合 + 分组过滤）
@@ -2027,9 +2088,14 @@ class ClipVaultGUI:
         self._close_group_menu()  # 拆卸窗口时顺手收起模态菜单，释放 grab
 
     def _schedule_refresh(self) -> None:
-        """每 5 秒拉一次数据；指纹不变不重绘（不闪）。"""
+        """每 5 秒拉一次数据；指纹不变不重绘（不闪）。
+
+        顺带跑「每周清理未分组」的到期检查（cleanup 内部按小时节流，
+        状态文件读取足够廉价，不会给 5 秒刷新增加可感知开销）。
+        """
         if self._refresh_stopped:
             return
+        self._maybe_auto_cleanup()
         self._load_and_render()
         self.root.after(AUTO_REFRESH_MS, self._schedule_refresh)
 

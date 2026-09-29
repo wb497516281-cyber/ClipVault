@@ -661,3 +661,74 @@ def test_gui_settings_test_uses_connection_selfcheck(window, monkeypatch):
     gui._close_settings()
     window.update()
     assert shown and "对话接口可用" in shown[0]
+
+
+# ---------------------------------------------------------------------------
+# 历史上限清理：手动清理 / 自动清理钩子
+# ---------------------------------------------------------------------------
+
+
+def test_gui_manual_cleanup_keeps_grouped_only(window, monkeypatch):
+    """「清理未分组」：二次确认后删未分组，分组内容留下。"""
+    import gui as gui_module
+    import storage
+    from gui import ClipVaultGUI
+
+    _seed()  # 3 条全部未分组（会被清掉）
+    grouped = storage.insert_item("text", content_hash="cu-1", text_content="入组的")
+    group = storage.create_group("收藏")
+    storage.add_item_to_group(grouped, group)
+
+    gui = ClipVaultGUI(window)
+    window.update()
+    assert storage.stats()["total"] == 4
+
+    monkeypatch.setattr(gui_module.messagebox, "askyesno", lambda *a, **k: True)
+    gui._cleanup_clicked()
+    window.update()
+
+    assert storage.stats()["total"] == 1  # 只剩入组那条
+    assert storage.get_item(grouped) is not None
+    assert "已清理" in gui.toast_var.get()
+
+
+def test_gui_manual_cleanup_cancelled_changes_nothing(window, monkeypatch):
+    """取消二次确认：一条不动。"""
+    import gui as gui_module
+    import storage
+    from gui import ClipVaultGUI
+
+    _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+    before = storage.stats()["total"]
+
+    monkeypatch.setattr(gui_module.messagebox, "askyesno", lambda *a, **k: False)
+    gui._cleanup_clicked()
+    window.update()
+
+    assert storage.stats()["total"] == before
+
+
+def test_gui_auto_cleanup_hook_refreshes_on_delete(window, monkeypatch):
+    """自动清理钩子：到期真删时强制刷新界面 + toast；没删则静默。"""
+    import cleanup
+    from gui import ClipVaultGUI
+
+    _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    # 没到期（maybe_run 返回 None）：不动界面
+    monkeypatch.setattr(cleanup, "maybe_run", lambda: None)
+    gui._fingerprint = "sentinel"
+    gui._maybe_auto_cleanup()
+    assert gui._fingerprint == "sentinel"
+
+    # 到期且删了 2 条：指纹作废（触发重绘）+ toast 汇报
+    monkeypatch.setattr(cleanup, "maybe_run", lambda: {"deleted": 2, "ran": True, "reason": ""})
+    gui._fingerprint = "sentinel"
+    gui._maybe_auto_cleanup()
+    window.update()
+    assert gui._fingerprint != "sentinel"
+    assert "每周清理" in gui.toast_var.get()

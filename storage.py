@@ -657,6 +657,41 @@ def ungrouped_text_items(limit: int = 500) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def delete_ungrouped_items() -> tuple[int, list[str]]:
+    """批量清理「未分组」条目：删行 + 删向量，返回 (删除条数, 图片相对路径列表)。
+
+    策略（用户要求）：未分组内容每周清一次；入了组的条目永不自动删除
+    （置顶但未分组的一并删——置顶只是展示优先级，分组才是保留信号）。
+    图片文件由调用方按相对路径删除（本函数只动数据库，保持与
+    delete_item 一致的分工：路径解析与 IMAGE_DIR 校验在懂目录的那一层）。
+    """
+    with closing(get_connection()) as conn:
+        with conn:  # 单事务：行与向量要么全删要么都不删
+            rows = conn.execute(
+                """
+                SELECT i.id, i.image_path, i.thumbnail_path
+                FROM clipboard_items i
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM clip_group_members m WHERE m.item_id = i.id
+                )
+                """
+            ).fetchall()
+            if not rows:
+                return 0, []
+            ids = [int(row["id"]) for row in rows]
+            paths = [
+                p for row in rows for p in (row["image_path"], row["thumbnail_path"]) if p
+            ]
+            placeholders = ",".join("?" * len(ids))
+            conn.execute(
+                f"DELETE FROM clip_vectors WHERE item_id IN ({placeholders})", tuple(ids)
+            )
+            conn.execute(
+                f"DELETE FROM clipboard_items WHERE id IN ({placeholders})", tuple(ids)
+            )
+    return len(ids), paths
+
+
 class ContentConflictError(Exception):
     """修改后的内容与另一条条目重复（内容哈希冲突）。"""
 

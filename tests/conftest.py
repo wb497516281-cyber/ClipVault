@@ -33,6 +33,7 @@ os.environ.setdefault("CLIPVAULT_AI_ENABLED", "0")
 import pytest  # noqa: E402
 
 import ai_client  # noqa: E402
+import config  # noqa: E402
 import storage  # noqa: E402
 
 
@@ -46,6 +47,9 @@ def clean_db():
         conn.execute("DELETE FROM clip_group_members")
         conn.execute("DELETE FROM clip_groups")
         conn.commit()
+    # 清理状态文件（cleanup 记录上次清理时间）：避免用例间互相影响到期判断
+    state_file = Path(config.get_data_dir()) / "cleanup_state.json"
+    state_file.unlink(missing_ok=True)
     yield
     with closing(storage.get_connection()) as conn:
         conn.execute("DELETE FROM clipboard_items")
@@ -53,6 +57,7 @@ def clean_db():
         conn.execute("DELETE FROM clip_group_members")
         conn.execute("DELETE FROM clip_groups")
         conn.commit()
+    state_file.unlink(missing_ok=True)
 
 
 @pytest.fixture(autouse=True)

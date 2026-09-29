@@ -42,6 +42,7 @@ a = Analysis(
         'watcher',
         'clipwriter',
         'ai_client',
+        'cleanup',
         'autostart',
         'config',
         'make_icon',
