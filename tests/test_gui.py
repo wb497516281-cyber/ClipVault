@@ -319,6 +319,23 @@ def test_build_preview_short_text_kept_whole():
     assert _build_preview("", 600) == ("", 1)
 
 
+def test_build_preview_normalizes_crlf():
+    """回归（截图 bug 真凶）：Notepad 复制的 \\r\\n 行尾。
+
+    Tk 把 \\r 和 \\n 都当换行，\\r\\n 会渲染成双倍行距——不先归一化，
+    行数估算全失真、文字照样溢出卡片、meta 行插中间。
+    """
+    from gui import MAX_CARD_LINES, _build_preview
+
+    text = "\r\n".join(f"code-{i:04d}" for i in range(20))
+    preview, lines = _build_preview(text, 600)
+
+    assert "\r" not in preview  # 已归一化成 \n
+    assert lines == MAX_CARD_LINES
+    assert preview.count("\n") + 1 == lines  # 报告行数与实际渲染一致
+    assert preview.endswith(" …")
+
+
 def test_gui_editor_save_updates_content_and_title(window):
     """编辑保存：改内容+命名落库，且内容变化会重新入队 AI 分析。"""
     import tkinter as tk

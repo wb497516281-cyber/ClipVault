@@ -122,14 +122,18 @@ def _build_preview(text: str, width: int) -> tuple[str, int]:
     行数远大于「总字数 ÷ 每行字数」的毛估）；超过 MAX_CARD_LINES 就截到
     第 N 行并加省略号。字符宽度按中文约 13px/字毛估，与绘制时的
     width=w-24 换行为同一量级即可（宁可高一行，不可溢出）。
+
+    行尾必须先归一化成 \\n：Tk 把 \\r 和 \\n 都当换行符，Notepad 之类复制
+    来的 \\r\\n 会渲染成双倍行距——不处理的话行数估算全部失真、文字溢出卡片。
     """
     chars_per_line = max(20, width // 13)
     if not text:
         return "", 1
-    truncated = len(text) > TEXT_PREVIEW_CHARS
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    truncated = len(normalized) > TEXT_PREVIEW_CHARS
     kept: list[str] = []
     used = 0
-    for segment in text[:TEXT_PREVIEW_CHARS].split("\n"):
+    for segment in normalized[:TEXT_PREVIEW_CHARS].split("\n"):
         seg_lines = max(1, (len(segment) + chars_per_line - 1) // chars_per_line)
         if used + seg_lines > MAX_CARD_LINES:
             truncated = True

@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 #: 应用版本号（与 pyproject.toml 的 version 保持一致，tests/test_config.py 有校验）
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 
 
 def _runtime_base_dir() -> Path:
