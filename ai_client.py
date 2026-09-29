@@ -333,6 +333,63 @@ def test_connection() -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
+def _parse_yes_no(content: str) -> bool | None:
+    """模型的是/否回答解析；拿不准返回 None（调用方按安全侧处理）。
+
+    容错：模型会带标点、换行、废话，取第一行看开头词。
+    """
+    if not isinstance(content, str):
+        return None
+    first_line = content.strip().splitlines()[0].strip() if content.strip() else ""
+    first_line = first_line.strip("。.!！,，:：\"'` ")
+    if not first_line:
+        return None
+    low = first_line.lower()
+    # 先判否：「不是/否/no/false」——避免「不是」被「是」的前缀匹配吃掉
+    if low.startswith(("不是", "否", "no", "false", "n/a", "n ")):
+        return False
+    if low.startswith(("是", "yes", "true", "y ", "sure", "correct")):
+        return True
+    return None
+
+
+def detect_api_key(text: str) -> bool:
+    """AI 判断内容是否是 API 密钥 / Token / 访问凭证。
+
+    供「规则分组」用：命中即自动入 API 组。未配置 AI / 请求失败 /
+    模型回答拿不准，一律返回 False（安全侧：宁可漏检也不错分）。
+    """
+    if not is_configured() or not (text or "").strip():
+        return False
+    data = _post_json(
+        "/chat/completions",
+        {
+            "model": _get_setting("CHAT_MODEL", CHAT_MODEL),
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是剪贴板内容检测器。判断下面这段内容是否是 API 密钥、"
+                        "访问令牌（Token）或任何形式的访问凭证"
+                        "（形如 sk-xxx、api_key=xxx、Bearer xxx 等）。"
+                        "只回答“是”或“否”，不要任何解释。"
+                    ),
+                },
+                {"role": "user", "content": text[:800]},
+            ],
+            "temperature": 0,
+            "max_tokens": 8,
+        },
+    )
+    if not data:
+        return False
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return False
+    return _parse_yes_no(content) is True
+
+
 def classify_text(text: str) -> str | None:
     """把文本分类到候选类别之一；未配置/失败返回 None。
 
@@ -613,6 +670,9 @@ _worker_started = False
 def _worker_loop() -> None:
     """队列消费循环：对每条文本依次做分类与向量化，结果写回数据库。
 
+    最后跑一遍确定性规则（rules.py：API 密钥检测 -> 自动入 API 组），
+    未命中也只是不入组，不影响前面的分类/向量结果。
+
     陈旧校验放在「网络请求之后、写库之前」：用户在请求期间编辑该条
     （内容变、向量已清）时丢弃结果，禁止把旧文本的向量/分类写回去
     造成语义搜索错配。
@@ -631,6 +691,13 @@ def _worker_loop() -> None:
                 storage.set_category(item_id, category)
             if vector:
                 storage.upsert_vector(item_id, vector, _get_setting("EMBED_MODEL", EMBED_MODEL))
+            # 规则分组（懒 import 避免循环依赖：rules -> ai_client）
+            try:
+                import rules
+
+                rules.apply_rule(item_id, text)
+            except Exception as exc:  # 规则失败绝不拖垮分析队列
+                logger.info("规则分组跳过（id=%s）：%s", item_id, exc)
         except Exception as exc:  # 兜底：绝不让守护线程退出
             logger.warning("AI 分析任务失败（id=%s）：%s", item_id, exc)
         finally:

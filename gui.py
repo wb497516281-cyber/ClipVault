@@ -9,14 +9,16 @@
   5. 左键单击卡片 → 打开详情窗（文本全文/图片原图，带复制按钮）；
   6. 左键双击卡片 → 写回系统剪贴板（文本 CF_UNICODETEXT；图片多格式，QQ/微信可粘贴）；
   7. 右键卡片 → 操作菜单（打开/复制/置顶/编辑/分组/删除）；
-  8. 悬停卡片出现「分组 / 置顶 / 编辑 / 删除」按钮；删除两步确认；
-  9. 「分组」按钮弹出成员菜单：勾选加入/移出分组、现场新建分组、✨AI 建议本条去哪组；
-  10. 分组栏「AI 自动分组」：后台把未分组条目分批交给分类模型归组（未配置 AI 自动降级）；
-  11. 🧹 历史上限：未分组内容按每条保存时间单独算，满 N 天（默认 7）自动删，分组内容永久保留；分组栏「清理未分组」可立即手动清；
-  12. 🔆 自动更新（打包版）：启动后台检查 GitHub Release，有新版本就下载，确认后重启热替换；
-  13. 置顶条目排最前且不同底色 + 左侧强调条；
-  14. 每 5 秒自动刷新（数据没变不重绘，不闪）；剪贴板采集在后台线程运行；
-  15. 语义检索走后台线程 + 查询向量缓存，接口慢不冻结界面。
+   8. Ctrl+左键多选卡片 → 批量操作栏（已选 N 条 / 分组到▾ / 删除 / 取消选择；Esc 或点空白取消）；
+  9. 悬停卡片出现「分组 / 置顶 / 编辑 / 删除」按钮；删除两步确认；
+  10. 「分组」按钮弹出成员菜单：勾选加入/移出分组、现场新建分组、✨AI 建议本条去哪组；
+  11. 分组栏「AI 自动分组」：后台把未分组条目分批交给分类模型归组（未配置 AI 自动降级）；
+  12. 🛡 规则分组：AI 检测 API 密钥/Token → 自动入「API」组（新内容实时检测 + 手动批量跑）；
+  13. 🧹 历史上限：未分组内容按每条保存时间单独算，满 N 天（默认 7）自动删，分组内容永久保留；分组栏「清理未分组」可立即手动清；
+  14. 🔆 自动更新（打包版）：启动后台检查 GitHub Release，有新版本就下载，确认后重启热替换；
+  15. 置顶条目排最前且不同底色 + 左侧强调条；
+  16. 每 5 秒自动刷新（数据没变不重绘，不闪）；剪贴板采集在后台线程运行；
+  17. 语义检索走后台线程 + 查询向量缓存，接口慢不冻结界面。
 
 运行：python gui.py            （默认同时启动采集器）
       python gui.py --no-watch （只看界面，不采集）
@@ -45,6 +47,7 @@ import ai_client
 import cleanup
 import clipwriter
 import config
+import rules
 import storage
 import updater
 from config import BASE_DIR
@@ -77,6 +80,7 @@ C_BG = "#15181d"  # 窗口底
 C_CARD = "#1e222a"  # 卡片
 C_CARD_HOVER = "#242935"  # 卡片悬停
 C_CARD_PINNED = "#3a3320"  # 置顶卡片
+C_CARD_SELECTED = "#27324a"  # 多选选中卡片
 C_PINNED_BAR = "#d9a92c"  # 置顶左侧强调条
 C_BORDER = "#2e3540"
 C_TEXT = "#e8ecf1"
@@ -185,6 +189,7 @@ class ClipVaultGUI:
         self.group_id: int | None = None  # 当前查看的分组（None = 不在具体分组视图）
         self.show_ungrouped: bool = False  # 当前是否查看「未分组」
         self._group_menu_win: tk.Toplevel | None = None  # 卡片「分组」成员菜单
+        self._selected_ids: set[int] = set()  # 多选（批量分组/删除）的条目 id
         self._pending_open_timer: str | None = None  # 单击「打开」的延迟定时器
         self._detail_wins: dict[int, tk.Toplevel] = {}  # 已打开的详情窗（item_id -> 窗）
 
@@ -285,6 +290,66 @@ class ClipVaultGUI:
         canvas_frame = tk.Frame(main, bg=C_BG)
         canvas_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
 
+        # —— 批量操作栏（有选中条目时才显示） ——
+        self.batch_bar = tk.Frame(canvas_frame, bg="#222831", padx=8, pady=4)
+        self.batch_label = tk.Label(
+            self.batch_bar,
+            text="",
+            bg="#222831",
+            fg=C_TEXT,
+            font=("Microsoft YaHei UI", 10),
+        )
+        self.batch_label.pack(side=tk.LEFT)
+        tk.Button(
+            self.batch_bar,
+            text="分组到 ▾",
+            command=self._open_batch_group_menu,
+            bg=C_CARD,
+            fg=C_TEXT,
+            activebackground=C_CARD_HOVER,
+            activeforeground=C_TEXT,
+            relief=tk.FLAT,
+            font=("Microsoft YaHei UI", 9),
+            padx=10,
+            pady=1,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=(10, 4))
+        tk.Button(
+            self.batch_bar,
+            text="删除",
+            command=self._batch_delete_clicked,
+            bg=C_DANGER,
+            fg="#ffffff",
+            activebackground=C_CARD_HOVER,
+            activeforeground=C_TEXT,
+            relief=tk.FLAT,
+            font=("Microsoft YaHei UI", 9),
+            padx=10,
+            pady=1,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=4)
+        tk.Button(
+            self.batch_bar,
+            text="取消选择",
+            command=self._clear_selection,
+            bg=C_CARD,
+            fg=C_DIM,
+            activebackground=C_CARD_HOVER,
+            activeforeground=C_TEXT,
+            relief=tk.FLAT,
+            font=("Microsoft YaHei UI", 9),
+            padx=10,
+            pady=1,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=4)
+        tk.Label(
+            self.batch_bar,
+            text="Ctrl+左键多选 · Esc 取消",
+            bg="#222831",
+            fg=C_DIM,
+            font=("Microsoft YaHei UI", 9),
+        ).pack(side=tk.RIGHT)
+
         self.canvas = tk.Canvas(
             canvas_frame,
             bg=C_BG,
@@ -296,13 +361,16 @@ class ClipVaultGUI:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # 画布事件：点击 / 双击 / 右键 / 悬停 / 滚轮 / 尺寸变化
+        # 画布事件：单击打开 / 双击复制 / 右键菜单 / Ctrl+左键多选 / 悬停 / 滚轮
         self.canvas.bind("<Button-1>", self._on_click)
         self.canvas.bind("<Double-Button-1>", self._on_double_click)
         self.canvas.bind("<Button-3>", self._on_right_click)
+        self.canvas.bind("<Control-Button-1>", self._on_ctrl_click)
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<Configure>", self._on_canvas_resize)
+        # Esc：先取消多选，其次取消待执行的单击打开
+        self.root.bind("<Escape>", self._on_escape)
 
         # —— 底部提示（toast） ——
         self.toast_var = tk.StringVar(value="")
@@ -424,6 +492,24 @@ class ClipVaultGUI:
             state=tk.NORMAL if self.ai_configured else tk.DISABLED,
         )
         self.auto_group_btn.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
+
+        # —— 规则分组（AI 检测 API 密钥 -> 自动入 API 组；未配置 AI 置灰） ——
+        self.rules_btn = tk.Button(
+            self.sidebar,
+            text="🛡 规则分组",
+            command=self.start_rules_group,
+            bg=C_CARD,
+            fg=C_TEXT,
+            activebackground=C_CARD_HOVER,
+            activeforeground=C_TEXT,
+            relief=tk.FLAT,
+            font=("Microsoft YaHei UI", 10),
+            padx=10,
+            pady=3,
+            cursor="hand2",
+            state=tk.NORMAL if self.ai_configured else tk.DISABLED,
+        )
+        self.rules_btn.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
 
         # —— 固定导航：全部 / 未分组（计数在 _rebuild_sidebar 更新） ——
         self.group_nav_buttons: dict[str, tk.Button] = {}
@@ -862,11 +948,14 @@ class ClipVaultGUI:
         return lines * 22 + META_HEIGHT + 16 + extra
 
     def _draw_card(self, item: dict, x: int, y: int, w: int, h: int) -> None:
-        """画单张卡片（背景/内容/元信息/悬停按钮）。"""
+        """画单张卡片（背景/内容/元信息/悬停按钮/选中态）。"""
         pinned = bool(item["is_pinned"])
         hovered = self.hovered_id == item["id"]
+        selected = item["id"] in self._selected_ids
 
-        if pinned:
+        if selected:
+            bg = C_CARD_SELECTED  # 多选优先：一眼看出哪些在批量操作集里
+        elif pinned:
             bg = C_CARD_PINNED
         elif hovered:
             bg = C_CARD_HOVER
@@ -880,7 +969,7 @@ class ClipVaultGUI:
             x + w,
             y + h,
             fill=bg,
-            outline=C_BORDER,
+            outline=C_ACCENT if selected else C_BORDER,
             width=1,
             tags=("card", f"card-{item['id']}"),
         )
@@ -893,6 +982,17 @@ class ClipVaultGUI:
                 y + h,
                 fill=C_PINNED_BAR,
                 outline=C_PINNED_BAR,
+                tags=("card", f"card-{item['id']}"),
+            )
+        # 选中标记：左上角勾
+        if selected:
+            self.canvas.create_text(
+                x + 14,
+                y + 12,
+                text="✓",
+                fill=C_ACCENT,
+                font=("Microsoft YaHei UI", 12, "bold"),
+                anchor=tk.NW,
                 tags=("card", f"card-{item['id']}"),
             )
 
@@ -1096,7 +1196,10 @@ class ClipVaultGUI:
         return (None, None)
 
     def _on_click(self, event) -> None:
-        """左键分发：悬停按钮即时生效；卡片本体单击 = 延迟打开（双击可取消）。"""
+        """左键分发：悬停按钮即时生效；卡片本体单击 = 延迟打开（双击可取消）。
+
+        点空白处：有多选时清空选择（批量操作结束的快捷方式）。
+        """
         kind, item_id = self._hit_test(event)
         if kind == "action:group" and item_id is not None:
             self._open_group_menu(event, item_id)
@@ -1108,6 +1211,8 @@ class ClipVaultGUI:
             self._handle_delete_click(item_id)
         elif kind == "card" and item_id is not None:
             self._schedule_open(item_id)
+        elif kind is None and self._selected_ids:
+            self._clear_selection()
 
     def _on_double_click(self, event) -> None:
         """左键双击卡片 = 复制到剪贴板（同时取消单击安排的「打开」）。"""
@@ -1115,6 +1220,116 @@ class ClipVaultGUI:
         kind, item_id = self._hit_test(event)
         if kind == "card" and item_id is not None:
             self._copy_item(item_id)
+
+    # ------------------------------------------------------------------
+    # 多选与批量操作（Ctrl+左键多选；批量分组/删除）
+    # ------------------------------------------------------------------
+
+    def _on_ctrl_click(self, event) -> None:
+        """Ctrl+左键点卡片 = 加入/移出选择集（不触发打开详情）。"""
+        self._cancel_scheduled_open()
+        kind, item_id = self._hit_test(event)
+        if kind == "card" and item_id is not None:
+            if item_id in self._selected_ids:
+                self._selected_ids.discard(item_id)
+            else:
+                self._selected_ids.add(item_id)
+            self._render()
+            self._refresh_batch_bar()
+
+    def _on_escape(self, _event=None) -> None:
+        """Esc：有选择先清选择，其次取消待执行的单击打开。"""
+        if self._selected_ids:
+            self._clear_selection()
+            return
+        self._cancel_scheduled_open()
+
+    def _clear_selection(self) -> None:
+        """清空多选并隐藏批量栏。"""
+        if not self._selected_ids and not self.batch_bar.winfo_ismapped():
+            return
+        self._selected_ids.clear()
+        self._render()
+        self._refresh_batch_bar()
+
+    def _refresh_batch_bar(self) -> None:
+        """按当前选择数显示/隐藏批量操作栏。"""
+        count = len(self._selected_ids)
+        if count > 0:
+            self.batch_label.configure(text=f"已选 {count} 条")
+            self.batch_bar.pack(fill=tk.X, pady=(0, 4))
+        else:
+            self.batch_bar.pack_forget()
+
+    def _open_batch_group_menu(self) -> None:
+        """「分组到 ▾」：列出现有分组 + 新建，选中后把多选条目批量入组。"""
+        if not self._selected_ids:
+            return
+        menu = tk.Menu(self.root, tearoff=0)
+        for group in storage.list_groups():
+            menu.add_command(
+                label=f"{group['name']}（{group['count']}）",
+                command=lambda gid=group["id"]: self._batch_assign_group(gid),
+            )
+        menu.add_separator()
+        menu.add_command(label="＋ 新建分组…", command=self._batch_new_group)
+        x = self.batch_bar.winfo_rootx() + 60
+        y = self.batch_bar.winfo_rooty() + self.batch_bar.winfo_height() + 2
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _batch_assign_group(self, group_id: int) -> None:
+        """批量把选中条目加入指定分组（替换各条目的分组归属）。"""
+        if not self._selected_ids:
+            return
+        for item_id in self._selected_ids:
+            storage.set_item_groups(item_id, [group_id])
+        count = len(self._selected_ids)
+        group = storage.get_group(group_id)
+        self._clear_selection()
+        self._group_sig = None
+        self._fingerprint = None
+        self._load_and_render()
+        self._toast(f"🗂 已将 {count} 条加入「{group['name'] if group else group_id}」")
+
+    def _batch_new_group(self) -> None:
+        """批量菜单里新建分组，并把选中条目放进去。"""
+        if not self._selected_ids:
+            return
+        name = simpledialog.askstring("新建分组", "分组名称：", parent=self.root)
+        if not name or not name.strip():
+            return
+        try:
+            group_id = storage.create_group(name)
+        except ValueError as exc:
+            messagebox.showwarning("新建分组", str(exc), parent=self.root)
+            return
+        self._batch_assign_group(group_id)
+
+    def _batch_delete_clicked(self) -> None:
+        """批量删除：弹窗确认后删行 + 向量 + 图片文件。"""
+        count = len(self._selected_ids)
+        if count <= 0:
+            return
+        confirmed = messagebox.askyesno(
+            "批量删除", f"确定删除选中的 {count} 条记录吗？（图片会连文件一起删）", parent=self.root
+        )
+        if not confirmed:
+            return
+        ids = list(self._selected_ids)
+        paths = storage.delete_items(ids)
+        for rel in paths:
+            path = (storage.DATA_DIR / rel).resolve()
+            # 只删数据目录内的文件，防路径穿越
+            if path.is_file() and storage.IMAGE_DIR in path.parents:
+                path.unlink()
+        self._clear_selection()
+        self._group_sig = None
+        self._fingerprint = None
+        self._load_and_render()
+        self._toast(f"🗑 已删除 {count} 条记录")
 
     def _on_right_click(self, event) -> None:
         """右键卡片 = 弹出操作菜单（打开/复制/置顶/编辑/分组/删除）。"""
@@ -1678,6 +1893,41 @@ class ClipVaultGUI:
             target=self._auto_group_worker, name="clipvault-auto-group", daemon=True
         ).start()
 
+    def start_rules_group(self) -> None:
+        """启动规则分组（后台线程；AI 检测 API 密钥 -> 自动入 API 组）。"""
+        if not self.ai_configured:
+            self._toast("规则检测需要 AI：请先在「AI 设置」里配好 Key", error=True)
+            return
+        if getattr(self, "_rules_running", False):
+            self._toast("规则分组正在进行中…")
+            return
+        self._rules_running = True
+        self._toast("🛡 规则分组中（AI 检测 API 密钥…）")
+        threading.Thread(
+            target=self._rules_worker, name="clipvault-rules-group", daemon=True
+        ).start()
+
+    def _rules_worker(self) -> None:
+        """后台跑规则分组；完成回主线程刷新 + 汇报。"""
+        try:
+            message = self._run_rules_group()
+        except Exception as exc:
+            message = f"规则分组出错：{exc}"
+        self.root.after(0, self._finish_rules_group, message)
+
+    def _run_rules_group(self) -> str:
+        """同步执行规则分组（后台线程调用）；返回汇报文案。"""
+        rows = storage.ungrouped_text_items(500)
+        if not rows:
+            return "没有未分组的条目"
+        payload = [(row["id"], row["text_content"] or "") for row in rows]
+        result = rules.run_rules(payload)
+        if result["applied"] > 0:
+            return (
+                f"规则分组完成：{result['applied']} 条 API 密钥已入「{rules.API_RULE_GROUP}」组"
+            )
+        return "未检测到 API 密钥/Token"
+
     def _run_auto_group(self) -> str:
         """同步执行 AI 自动分组（后台线程调用）；返回汇报文案。
 
@@ -1730,6 +1980,14 @@ class ClipVaultGUI:
     def _finish_auto_group(self, message: str) -> None:
         """主线程收尾：刷新列表与分组栏，toast 汇报。"""
         self._auto_group_running = False
+        self._group_sig = None
+        self._fingerprint = None
+        self._load_and_render()
+        self._toast(message)
+
+    def _finish_rules_group(self, message: str) -> None:
+        """规则分组主线程收尾：刷新列表与分组栏，toast 汇报。"""
+        self._rules_running = False
         self._group_sig = None
         self._fingerprint = None
         self._load_and_render()
@@ -2126,6 +2384,10 @@ class ClipVaultGUI:
             state=tk.NORMAL if self.ai_configured else tk.DISABLED,
             bg=C_ACCENT if self.ai_configured else C_CARD,
             fg="#ffffff" if self.ai_configured else C_DIM,
+        )
+        # 规则分组按钮同理（API 检测走 AI）
+        self.rules_btn.configure(
+            state=tk.NORMAL if self.ai_configured else tk.DISABLED,
         )
         # 通知外部（托盘）刷新动态菜单：pystray 菜单只构建一次，需显式 update_menu
         hook = getattr(self, "notify_hook", None)

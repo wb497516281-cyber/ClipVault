@@ -442,6 +442,39 @@ def delete_item(item_id: int) -> list[str]:
     return paths
 
 
+def delete_items(item_ids: Sequence[int]) -> list[str]:
+    """批量删除条目（行 + 向量 + 分组成员关系），返回全部图片相对路径。
+
+    单事务：要么全删要么都不删；空列表直接返回。文件删除由调用方负责。
+    """
+    ids = [int(i) for i in item_ids]
+    if not ids:
+        return []
+    with closing(get_connection()) as conn:
+        with conn:  # 单事务
+            rows = conn.execute(
+                "SELECT image_path, thumbnail_path FROM clipboard_items"
+                f" WHERE id IN ({','.join('?' * len(ids))})",
+                tuple(ids),
+            ).fetchall()
+            if not rows:
+                return []
+            paths = [p for row in rows for p in (row["image_path"], row["thumbnail_path"]) if p]
+            conn.execute(
+                f"DELETE FROM clip_group_members WHERE item_id IN ({','.join('?' * len(ids))})",
+                tuple(ids),
+            )
+            conn.execute(
+                f"DELETE FROM clip_vectors WHERE item_id IN ({','.join('?' * len(ids))})",
+                tuple(ids),
+            )
+            conn.execute(
+                f"DELETE FROM clipboard_items WHERE id IN ({','.join('?' * len(ids))})",
+                tuple(ids),
+            )
+    return paths
+
+
 def update_item_title(item_id: int, title: str) -> None:
     """给条目命名（title）；传空串表示清除名称。"""
     with closing(get_connection()) as conn:

@@ -1045,3 +1045,177 @@ def test_gui_context_menu_pinned_label_flips(window):
         labels.append(menu.entrycget(i, "label"))
     assert labels[2] == "取消置顶"  # 第三项动作从「置顶」翻面
     menu.destroy()
+
+
+# ---------------------------------------------------------------------------
+# 多选与批量操作（Ctrl+左键多选；批量分组/删除）
+# ---------------------------------------------------------------------------
+
+
+def _card_event(gui, item_id):
+    """构造卡片本体上的点击事件（避开悬停按钮区）。"""
+    cx, cy, cw, ch = gui._card_rects[item_id]
+
+    class _Evt:
+        def __init__(self, x, y):
+            self.x, self.y = x, y
+
+    return _Evt(cx + 30, cy + ch - 12)
+
+
+def test_ctrl_click_toggles_selection(window, monkeypatch):
+    """Ctrl+左键点卡片 = 加入/移出选择集（不触发打开详情）。"""
+    from gui import ClipVaultGUI
+
+    _, text_id, _ = _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    first_id = gui.items[0]["id"]
+    opened: list[int] = []
+    monkeypatch.setattr(gui, "open_detail", lambda i: opened.append(i))
+
+    event = _card_event(gui, first_id)
+    gui._on_ctrl_click(event)  # 加入
+    assert first_id in gui._selected_ids
+    assert gui._pending_open_timer is None  # 没有安排延迟打开
+    assert opened == []
+
+    gui._on_ctrl_click(event)  # 再点：移出
+    assert first_id not in gui._selected_ids
+    assert gui._pending_open_timer is None
+
+
+def test_batch_bar_shows_only_with_selection(window):
+    """批量操作栏：有选中才出现，条数正确；清空选择后隐藏。
+
+    注：测试 fixture 的根窗口是 withdraw 的，winfo_ismapped 永远为 False，
+    这里用 winfo_manager（pack 状态）断言显示/隐藏。
+    """
+    from gui import ClipVaultGUI
+
+    _, text_id, _ = _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+    assert gui.batch_bar.winfo_manager() != "pack"  # 没选择：未显示
+
+    first_id = gui.items[0]["id"]
+    gui._on_ctrl_click(_card_event(gui, first_id))
+    gui._on_ctrl_click(_card_event(gui, gui.items[1]["id"]))
+    window.update()
+    assert gui.batch_bar.winfo_manager() == "pack"
+    assert gui.batch_label["text"] == "已选 2 条"
+
+    gui._clear_selection()
+    window.update()
+    assert gui.batch_bar.winfo_manager() != "pack"
+
+
+def test_batch_delete_removes_rows(window, monkeypatch):
+    """批量删除：确认后删行 + 清选择（图片条目文件也删）。"""
+    import gui as gui_module
+    import storage
+    from gui import ClipVaultGUI
+
+    image_id, text_id, _ = _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+    monkeypatch.setattr(gui_module.messagebox, "askyesno", lambda *a, **k: True)
+
+    gui._on_ctrl_click(_card_event(gui, image_id))
+    gui._on_ctrl_click(_card_event(gui, text_id))
+    gui._batch_delete_clicked()
+    window.update()
+
+    assert storage.get_item(image_id) is None
+    assert storage.get_item(text_id) is None
+    assert not (storage.IMAGE_DIR / "gui_probe.png").exists()  # 图片文件连带删
+    assert gui._selected_ids == set()  # 选择已清
+    assert gui.batch_bar.winfo_manager() != "pack"
+
+
+def test_batch_delete_cancelled_changes_nothing(window, monkeypatch):
+    """批量删除取消：一条不动。"""
+    import gui as gui_module
+    import storage
+    from gui import ClipVaultGUI
+
+    _, text_id, _ = _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+    monkeypatch.setattr(gui_module.messagebox, "askyesno", lambda *a, **k: False)
+
+    gui._on_ctrl_click(_card_event(gui, text_id))
+    gui._batch_delete_clicked()
+    window.update()
+
+    assert storage.get_item(text_id) is not None
+    assert text_id in gui._selected_ids  # 选择保留，还能继续操作
+
+
+def test_batch_assign_group(window):
+    """批量「分组到」：选中条目入目标组，选择清空并刷新。"""
+    import storage
+    from gui import ClipVaultGUI
+
+    _, text_id, _ = _seed()
+    group_id = storage.create_group("批量目标")
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    first_id = gui.items[0]["id"]
+    gui._on_ctrl_click(_card_event(gui, first_id))
+    gui._batch_assign_group(group_id)
+    window.update()
+
+    assert storage.item_group_ids(first_id) == [group_id]
+    assert gui._selected_ids == set()
+    assert gui.batch_bar.winfo_manager() != "pack"
+
+
+def test_escape_clears_selection(window):
+    """Esc：有选择先清选择。"""
+    from gui import ClipVaultGUI
+
+    _, text_id, _ = _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    gui._on_ctrl_click(_card_event(gui, text_id))
+    assert gui._selected_ids
+    gui._on_escape()
+    window.update()
+    assert gui._selected_ids == set()
+
+
+def test_plain_click_empty_area_clears_selection(window):
+    """左键点空白处：清空选择。"""
+    from gui import ClipVaultGUI
+
+    _, text_id, _ = _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    gui._on_ctrl_click(_card_event(gui, text_id))
+    assert gui._selected_ids
+
+    class _Evt:
+        x, y = 50, 100000  # 画布最底部空白（不在任何卡片内）
+
+    gui._on_click(_Evt())
+    window.update()
+    assert gui._selected_ids == set()
+
+
+def test_rules_button_requires_ai(window):
+    """规则分组按钮：未配置 AI 时 toast 提示并不起线程。"""
+    from gui import ClipVaultGUI
+
+    _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    assert gui.ai_configured is False
+    gui.start_rules_group()
+    assert getattr(gui, "_rules_running", False) is False
+    assert "规则检测需要 AI" in gui.toast_var.get()

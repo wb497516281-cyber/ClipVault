@@ -379,3 +379,35 @@ def test_legacy_db_gains_title_column():
     with closing(storage.get_connection()) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(clipboard_items)")}
     assert "title" in columns
+
+
+def test_delete_items_batch():
+    """批量删除：行 + 向量 + 成员关系都清；返回图片路径；空列表安全。"""
+    from PIL import Image
+
+    storage.IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    img = Image.new("RGB", (10, 10), (1, 2, 3))
+    img.save(storage.IMAGE_DIR / "batch.png")
+    image_id = storage.insert_item(
+        "image",
+        content_hash="batch-img",
+        image_path="images/batch.png",
+        thumbnail_path="images/thumb_batch.png",
+    )
+    text_id = storage.insert_item("text", content_hash="batch-text", text_content="会被删")
+    keep_id = storage.insert_item("text", content_hash="batch-keep", text_content="保留")
+    group = storage.create_group("g")
+    storage.add_item_to_group(text_id, group)
+    storage.add_item_to_group(keep_id, group)
+    storage.upsert_vector(text_id, [1.0], "m")
+
+    paths = storage.delete_items([image_id, text_id, 99999])  # 含不存在的 id
+
+    assert set(paths) == {"images/batch.png", "images/thumb_batch.png"}
+    assert storage.get_item(image_id) is None
+    assert storage.get_item(text_id) is None
+    assert storage.get_item(99999) is None
+    assert storage.get_item(keep_id) is not None  # 没选中的保留
+    assert storage.item_group_ids(keep_id) == [group]  # 保留条目的分组不动
+    assert storage.load_vectors() == []  # 向量连带删
+    assert storage.delete_items([]) == []  # 空列表安全
