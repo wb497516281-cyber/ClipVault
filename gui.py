@@ -63,6 +63,9 @@ DELETE_CONFIRM_MS = 3000
 #: 单次拉取条数上限
 LIST_LIMIT = 200
 
+#: 文本卡片最多渲染几行预览（超过截断加省略号，防止长文本把卡片撑爆）
+MAX_CARD_LINES = 8
+
 #: 主题色（深色）
 C_BG = "#15181d"  # 窗口底
 C_CARD = "#1e222a"  # 卡片
@@ -110,6 +113,33 @@ def _fmt_time(created_at: str) -> str:
     if diff < 86400 * 30:
         return f"{diff // 86400} 天前"
     return f"{diff // 86400 // 30} 个月前"
+
+
+def _build_preview(text: str, width: int) -> tuple[str, int]:
+    """生成卡片文本预览与它的行数——高度估算和绘制共用这一份，杜绝错位。
+
+    按换行符逐段估算行数（短行多的文本，如一页恢复码/逐行清单，实际渲染
+    行数远大于「总字数 ÷ 每行字数」的毛估）；超过 MAX_CARD_LINES 就截到
+    第 N 行并加省略号。字符宽度按中文约 13px/字毛估，与绘制时的
+    width=w-24 换行为同一量级即可（宁可高一行，不可溢出）。
+    """
+    chars_per_line = max(20, width // 13)
+    if not text:
+        return "", 1
+    truncated = len(text) > TEXT_PREVIEW_CHARS
+    kept: list[str] = []
+    used = 0
+    for segment in text[:TEXT_PREVIEW_CHARS].split("\n"):
+        seg_lines = max(1, (len(segment) + chars_per_line - 1) // chars_per_line)
+        if used + seg_lines > MAX_CARD_LINES:
+            truncated = True
+            break
+        kept.append(segment)
+        used += seg_lines
+    preview = "\n".join(kept)
+    if truncated and kept:
+        preview += " …"
+    return preview, max(1, used)
 
 
 class ClipVaultGUI:
@@ -806,13 +836,15 @@ class ClipVaultGUI:
         self.count_var.set(f"{len(self.items)} 条")
 
     def _card_height(self, item: dict, width: int) -> int:
-        """估算卡片高度：图片卡固定，文本卡按行数估算；有名称行另加一行。"""
+        """估算卡片高度：图片卡固定，文本卡按行数估算；有名称行另加一行。
+
+        行数必须与 _draw_card 实际渲染的预览一致——共用 _build_preview，
+        否则短行多的文本（一页恢复码、逐行清单）会溢出卡片，meta 行插到文字中间。
+        """
         extra = 22 if item.get("title") else 0
         if item["content_type"] == "image":
             return THUMB_SIZE + META_HEIGHT + 16 + extra
-        text = item.get("text_content") or ""
-        chars_per_line = max(20, width // 13)  # 中文约 13px/字
-        lines = min(6, max(1, (len(text) + chars_per_line - 1) // chars_per_line))
+        _, lines = _build_preview(item.get("text_content") or "", width)
         return lines * 22 + META_HEIGHT + 16 + extra
 
     def _draw_card(self, item: dict, x: int, y: int, w: int, h: int) -> None:
@@ -873,7 +905,9 @@ class ClipVaultGUI:
             self._draw_thumb(item, x + 10, content_y, THUMB_SIZE)
         else:
             text = item.get("text_content") or ""
-            preview = text[:TEXT_PREVIEW_CHARS] + ("…" if len(text) > TEXT_PREVIEW_CHARS else "")
+            # 与 _card_height 共用一份预览：按换行逐段算行数，超限截断，
+            # 保证文字永远不会溢出卡片、meta 行不会插到文字中间
+            preview, _lines = _build_preview(text, w - 24)
             self.canvas.create_text(
                 x + 12,
                 content_y,

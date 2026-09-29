@@ -277,6 +277,48 @@ def test_gui_title_rendering_and_height(window):
     assert renamed.get("title") == "我的命名"
 
 
+def test_build_preview_short_lines_do_not_overflow():
+    """回归（截图 bug）：一页恢复码这种「一行一条」的短行文本。
+
+    高度估算必须按换行逐段算并封顶，预览行数与报告行数一致，
+    否则文字溢出卡片、meta 行插到文字中间。
+    """
+    from gui import MAX_CARD_LINES, _build_preview
+
+    codes = "\n".join(f"{i:05x}-{(i * 7) % 65536:05x}" for i in range(20))
+    preview, lines = _build_preview(codes, 600)
+
+    assert lines == MAX_CARD_LINES  # 封顶
+    assert preview.count("\n") + 1 == lines  # 预览行数与估算一致（不错位）
+    assert preview.endswith(" …")  # 截断有省略号
+
+
+def test_card_height_matches_preview_lines(window):
+    """卡片高度 == 预览行数对应的高度（meta 行永远在卡片底部）。"""
+    import storage
+    from gui import MAX_CARD_LINES, META_HEIGHT, ClipVaultGUI, _build_preview
+
+    text = "\n".join(f"code-{i:04d}-abcdef" for i in range(30))
+    item_id = storage.insert_item("text", content_hash="overflow-1", text_content=text)
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    item = storage.get_item(item_id)
+    _, lines = _build_preview(text, 600 - 24)
+    assert lines == MAX_CARD_LINES
+    assert gui._card_height(item, 600) == lines * 22 + META_HEIGHT + 16
+
+
+def test_build_preview_short_text_kept_whole():
+    """短文本原样保留、不加省略号、行数按实际算。"""
+    from gui import _build_preview
+
+    preview, lines = _build_preview("第一行\n第二行", 600)
+    assert preview == "第一行\n第二行"
+    assert lines == 2
+    assert _build_preview("", 600) == ("", 1)
+
+
 def test_gui_editor_save_updates_content_and_title(window):
     """编辑保存：改内容+命名落库，且内容变化会重新入队 AI 分析。"""
     import tkinter as tk
