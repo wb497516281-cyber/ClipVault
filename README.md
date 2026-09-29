@@ -54,7 +54,7 @@ clipvault/
 ├── tray.py              # 托盘常驻版（采集 + GUI 一体，需 pystray）
 ├── autostart.py         # 开机自启动管理（HKCU Run 键，无需管理员权限）
 ├── make_icon.py         # 生成 assets/ 图标（托盘 + exe）
-├── tests/               # pytest 测试（210 个用例，含真实 GUI 冒烟）
+├── tests/               # pytest 测试（217 个用例，含真实 GUI 冒烟）
 │   ├── conftest.py      #   隔离数据目录 + 每用例清库 + 默认关闭 AI + 队列排空
 │   ├── test_config.py   #   设置文件读写/优先级/.env/数据目录策略/旧数据迁移/版本同步
 │   ├── test_storage.py  #   建表/迁移/去重/列表搜索/置顶/删除(单条+批量)/编辑命名/向量
@@ -186,6 +186,8 @@ python autostart.py remove     # 移除
 
 > Ollama 等本机服务（`http://localhost` / `http://127.0.0.1`）无需 API Key；云端厂商必须填 Key。向量模型为空的厂商（DeepSeek、Moonshot）语义搜索不可用，其余功能正常。
 
+> **推理模型兼容**：部分端点（如 deepseek-flash 等带 reasoning 的模型）会先输出思考内容再给正式回答，思考就要数百 token。所有 chat 调用已内置「预算被思考吃满（content 为空 + finish_reason=length）时加预算自动重试」，分类 / 分组 / API 检测 / 连接测试均不受影响。
+
 **拉取模型**：填好 URL 和 Key 后点 Base URL 行尾的「拉取模型」，会自动请求 `GET /models` 把该账号可用模型填进「分类模型 / 向量模型」下拉框（也可继续手输）。只配了分类模型没有向量模型时，语义搜索不可用，其余功能正常。
 
 **优先级**：界面设置（settings.json）> 环境变量 / `.env` > 内置默认值。界面是最近一次显式操作，当场生效；想用环境变量锁定配置，清空界面设置即可。
@@ -254,7 +256,7 @@ pyinstaller packaging.spec
 
 ```powershell
 pip install -e ".[dev]"
-pytest                        # 210 个用例，无需网络；GUI 用例需要桌面环境
+pytest                        # 217 个用例，无需网络；GUI 用例需要桌面环境
 ruff check .                  # 代码规范检查
 ```
 

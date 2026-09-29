@@ -270,6 +270,65 @@ def fetch_models() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# chat 调用统一入口（处理「推理模型吃满 max_tokens」的坑）
+#
+# 真实踩坑（用户数据实验发现）：部分模型（如其用的 deepseek-flash 端点）会先输出
+# reasoning_content 再给正式回答，思考就要 400~800 token。早期各调用点把
+# max_tokens 设成 8~128，预算全被思考吃光、正式回答被截断（content 为空、
+# finish_reason=length）——分类/检测/连接测试全部静默失效。
+#
+# 现在的策略：正常预算跑一次；一旦 content 为空且 finish_reason=length
+# （典型「被思考吃满」信号），用大预算重试一次。
+# ---------------------------------------------------------------------------
+
+#: 重试预算（token）：分类/检测/连通性这类短回答足够
+RETRY_MAX_TOKENS = 1024
+
+#: 分组分配的重试预算：40 条的 JSON 本体就要约千 token，留给思考的余量取大些
+RETRY_MAX_TOKENS_JSON = 2048
+
+
+def _chat_content(
+    messages: list[dict],
+    max_tokens: int,
+    retry_tokens: int = RETRY_MAX_TOKENS,
+) -> str | None:
+    """调用 chat 接口并只取正文；「被思考吃满」时加预算重试一次。
+
+    返回正文字符串（可能为空串——模型确实没话说）；请求失败返回 None。
+    """
+    payload = {
+        "model": _get_setting("CHAT_MODEL", CHAT_MODEL),
+        "messages": messages,
+        "temperature": 0,
+        "max_tokens": max_tokens,
+    }
+    data = _post_json("/chat/completions", payload)
+    if not data:
+        return None
+    try:
+        choice = data["choices"][0]
+        content = choice["message"]["content"]
+        finish = choice.get("finish_reason")
+    except (KeyError, IndexError, TypeError):
+        return None
+    text = str(content) if isinstance(content, str) else ""
+    if not text.strip() and finish == "length" and retry_tokens > max_tokens:
+        # 推理把预算吃光：加预算重试一次（仍失败就认命，返回 None）
+        data = _post_json(
+            "/chat/completions", {**payload, "max_tokens": retry_tokens}
+        )
+        if not data:
+            return None
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            return None
+        text = str(content) if isinstance(content, str) else ""
+    return text
+
+
+# ---------------------------------------------------------------------------
 # 连接自检（设置窗「测试连接」）：按当前实际配置探测，而不是无脑测向量
 #
 # DeepSeek / Moonshot 等厂商没有 embedding 接口，旧实现只测 /embeddings，
@@ -282,20 +341,10 @@ def fetch_models() -> list[str]:
 
 def _chat_ping() -> str | None:
     """最小对话请求：用来验证 chat 接口与 Key 是否可用。"""
-    data = _post_json(
-        "/chat/completions",
-        {
-            "model": _get_setting("CHAT_MODEL", CHAT_MODEL),
-            "messages": [{"role": "user", "content": "ping"}],
-            "max_tokens": 8,
-        },
+    return _chat_content(
+        [{"role": "user", "content": "ping"}],
+        max_tokens=256,
     )
-    if not data:
-        return None
-    try:
-        return str(data["choices"][0]["message"]["content"])
-    except (KeyError, IndexError, TypeError):
-        return None
 
 
 def test_connection() -> tuple[bool, str]:
@@ -361,31 +410,22 @@ def detect_api_key(text: str) -> bool:
     """
     if not is_configured() or not (text or "").strip():
         return False
-    data = _post_json(
-        "/chat/completions",
-        {
-            "model": _get_setting("CHAT_MODEL", CHAT_MODEL),
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "你是剪贴板内容检测器。判断下面这段内容是否是 API 密钥、"
-                        "访问令牌（Token）或任何形式的访问凭证"
-                        "（形如 sk-xxx、api_key=xxx、Bearer xxx 等）。"
-                        "只回答“是”或“否”，不要任何解释。"
-                    ),
-                },
-                {"role": "user", "content": text[:800]},
-            ],
-            "temperature": 0,
-            "max_tokens": 8,
-        },
+    content = _chat_content(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "你是剪贴板内容检测器。判断下面这段内容是否是 API 密钥、"
+                    "访问令牌（Token）或任何形式的访问凭证"
+                    "（形如 sk-xxx、api_key=xxx、Bearer xxx 等）。"
+                    "只回答“是”或“否”，不要任何解释。"
+                ),
+            },
+            {"role": "user", "content": text[:800]},
+        ],
+        max_tokens=256,
     )
-    if not data:
-        return False
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
+    if not content:
         return False
     return _parse_yes_no(content) is True
 
@@ -403,25 +443,14 @@ def classify_text(text: str) -> str | None:
         f"只能从这些分类里选一个：{'、'.join(categories)}。"
         "只输出分类名本身，不要输出任何解释、标点或多余文字。"
     )
-    data = _post_json(
-        "/chat/completions",
-        {
-            "model": _get_setting("CHAT_MODEL", CHAT_MODEL),
-            "messages": [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": text[:1000]},
-            ],
-            "temperature": 0,
-            "max_tokens": 16,
-        },
+    content = _chat_content(
+        [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": text[:1000]},
+        ],
+        max_tokens=256,
     )
-    if not data:
-        return None
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        return None
-    if not isinstance(content, str):
+    if not content:
         return None
     content = content.strip()
     # 精确命中优先；否则按包含关系兜底（模型偶尔会多输出废话）
@@ -576,15 +605,14 @@ def assign_groups(
                 },
             ],
             "temperature": 0,
-            "max_tokens": max(128, len(batch) * 24),
+            # JSON 本体按每条约 24 token 估；重试预算另给 2048（推理模型思考开销大）
+            "max_tokens": max(256, len(batch) * 24),
         }
-        data = _post_json("/chat/completions", payload)
-        if not data:
+        content = _chat_content(
+            payload["messages"], payload["max_tokens"], retry_tokens=RETRY_MAX_TOKENS_JSON
+        )
+        if content is None:
             logger.info("AI 分组批次失败（第 %d 批，共 %d 条）", start, len(batch))
-            continue
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError):
             continue
         assigned = parse_group_assignment(content, valid_ids, existing)
         if assigned:

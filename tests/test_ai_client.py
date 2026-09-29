@@ -372,3 +372,75 @@ def test_connection_failure_includes_http_status(fake_key, monkeypatch):
     assert ok is False
     assert "401" in message
     assert ai_client.last_error() is not None
+
+
+# ---------------------------------------------------------------------------
+# chat 统一入口：推理模型吃满 max_tokens 的重试（真实数据实验发现的坑）
+# ---------------------------------------------------------------------------
+
+
+def test_chat_content_retries_when_reasoning_eats_budget(fake_key, monkeypatch):
+    """回归：content 空 + finish_reason=length（思考吃满预算）-> 加预算重试一次。"""
+    calls: list[int] = []
+
+    def fake_post(path, payload):
+        calls.append(payload["max_tokens"])
+        if len(calls) == 1:
+            # 模拟推理模型：token 全花在 reasoning_content 上，正式回答被截断
+            return {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
+        return {"choices": [{"message": {"content": "是"}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(ai_client, "_post_json", fake_post)
+    result = ai_client._chat_content([{"role": "user", "content": "x"}], 256)
+
+    assert result == "是"
+    assert calls == [256, ai_client.RETRY_MAX_TOKENS]  # 原预算 + 重试预算
+
+
+def test_chat_content_no_retry_when_not_truncated(fake_key, monkeypatch):
+    """finish_reason 不是 length（模型确实没话说）：不重试，原样返回空串。"""
+    calls: list[int] = []
+    monkeypatch.setattr(
+        ai_client,
+        "_post_json",
+        lambda path, payload: calls.append(payload["max_tokens"])
+        or {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]},
+    )
+    result = ai_client._chat_content([{"role": "user", "content": "x"}], 256)
+    assert result == ""
+    assert calls == [256]
+
+
+def test_chat_content_no_retry_when_budget_already_big(fake_key, monkeypatch):
+    """首轮预算已 >= 重试预算：即使被吃满也不重试（避免无限加码）。"""
+    calls: list[int] = []
+    monkeypatch.setattr(
+        ai_client,
+        "_post_json",
+        lambda path, payload: calls.append(payload["max_tokens"])
+        or {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]},
+    )
+    result = ai_client._chat_content([], ai_client.RETRY_MAX_TOKENS)
+    assert result == ""
+    assert calls == [ai_client.RETRY_MAX_TOKENS]
+
+
+def test_chat_content_request_failure_returns_none(fake_key, monkeypatch):
+    """请求失败返回 None（与 _post_json 契约一致）。"""
+    monkeypatch.setattr(ai_client, "_post_json", lambda *a, **k: None)
+    assert ai_client._chat_content([], 256) is None
+
+
+def test_detect_api_key_survives_reasoning_model(fake_key, monkeypatch):
+    """端到端：检测在推理模型（首轮被吃满、重试出答案）下仍能判对。"""
+    calls: list[int] = []
+
+    def fake_post(path, payload):
+        calls.append(payload["max_tokens"])
+        if len(calls) == 1:
+            return {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
+        return {"choices": [{"message": {"content": "是"}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(ai_client, "_post_json", fake_post)
+    assert ai_client.detect_api_key("sk-abc123") is True
+    assert calls[0] == 256 and calls[1] == ai_client.RETRY_MAX_TOKENS
