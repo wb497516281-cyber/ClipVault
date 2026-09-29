@@ -43,6 +43,7 @@ a = Analysis(
         'clipwriter',
         'ai_client',
         'cleanup',
+        'updater',
         'autostart',
         'config',
         'make_icon',

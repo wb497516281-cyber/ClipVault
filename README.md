@@ -9,6 +9,8 @@
 - 🔄 **后台自动采集**：0.5 秒轮询剪贴板，文本和图片（复制/截图）自动入库
 - 🗂️ **分组（AI + 手动）**：左侧分组栏把历史按项目/类型归拢；悬停卡片点「分组」勾选加入（可多选）、现场新建；「AI 自动分组」后台分批把未分组条目交给分类模型归组（优先复用现有分组，缺了就新建），单条还能让 AI 建议去哪组
 - 🧹 **历史上限清理**：**未分组内容每周自动清理一次，分组内容永久保留**；分组栏「🧹 清理未分组」可随时手动触发（二次确认，展示将删条数与下次自动清理时间）
+- 📦 **数据独立存放**：打包版数据放 `%LOCALAPPDATA%\ClipVault\data`（exe 外面），重新打包/覆盖更新都不碰它；旧版数据首次启动自动迁移
+- 🔆 **自动更新**（打包版）：启动后台检查 GitHub Release，有新版本就下载，确认后重启热替换；托盘菜单也可手动「检查更新」
 - 🖼️ **图片完整留存**：原图 + 200×200 缩略图存 `clipboard_data/images/`，数据库只存相对路径（**绝不存 BLOB**）
 - ⚡ **内容去重**：文本按 `sha256(text)`，图片按「转 RGB 后 PNG 字节」做像素级哈希，重复内容不重复入库
 - 🔍 **两级搜索**：关键词 LIKE 搜**内容 / 自定义命名 / 来源应用**（默认，纯本地）+ 语义向量搜索（可选 AI）；「智能」模式= 关键词命中排前 + 语义增量去重补后，搜命名一定不漏
@@ -44,18 +46,20 @@ clipvault/
 ├── watcher.py           # 剪贴板采集主循环（0.5s 轮询、图片优先、独占重试）
 ├── ai_client.py         # 可选 AI：分类/向量化/智能分组/余弦相似度/后台队列（未配置自动降级）
 ├── cleanup.py           # 历史上限清理：未分组内容每周自动清（分组永久保留）+ 手动清理
-├── config.py            # 配置：.env 加载 + CLIPVAULT_* 环境变量
+├── updater.py           # 自动更新：检查 GitHub Release / 后台下载 / 重启热替换（仅打包版）
+├── config.py            # 配置：.env 加载 + CLIPVAULT_* 环境变量 + 数据目录策略（打包版 %LOCALAPPDATA%）
 ├── tray.py              # 托盘常驻版（采集 + GUI 一体，需 pystray）
 ├── autostart.py         # 开机自启动管理（HKCU Run 键，无需管理员权限）
 ├── make_icon.py         # 生成 assets/ 图标（托盘 + exe）
-├── tests/               # pytest 测试（149 个用例，含真实 GUI 冒烟）
+├── tests/               # pytest 测试（172 个用例，含真实 GUI 冒烟）
 │   ├── conftest.py      #   隔离数据目录 + 每用例清库 + 默认关闭 AI + 队列排空
-│   ├── test_config.py   #   设置文件读写 / 优先级 / .env 解析 / 原子写 / 缓存
+│   ├── test_config.py   #   设置文件读写/优先级/.env/数据目录策略/旧数据迁移/版本同步
 │   ├── test_storage.py  #   建表/迁移/去重/列表搜索/置顶/删除/编辑命名/向量
 │   ├── test_watcher.py  #   哈希规则/命名/入库/去重/孤儿文件清理
 │   ├── test_ai_client.py#   降级/解析/相似度/队列/厂商预设/拉取模型/陈旧任务
 │   ├── test_groups.py   #   分组：CRUD/成员多对多/列表过滤/计数/AI 解析分配
 │   ├── test_cleanup.py  #   周清理：到期判断/删未分组留分组/删图片向量/手动与钩子
+│   ├── test_updater.py  #   自动更新：版本比较/release 解析/下载/热替换脚本
 │   ├── test_clipwriter.py#  格式转换 + QQ/微信多格式剪贴板（真实剪贴板验证）
 │   └── test_gui.py      #   真实 tkinter 窗口冒烟（渲染/筛选/置顶/删除两步/编辑保存/设置窗/命中）
 ├── assets/              # 图标（make_icon.py 生成）
@@ -138,6 +142,7 @@ python autostart.py remove     # 移除
 | **🧹 清理未分组** | 左栏「🧹 清理未分组」按钮：二次确认后立即清理；**每周也会自动清理一次**（未分组删、分组留） |
 | 分组管理 | 左栏右键分组 → 重命名 / 删除（删组不删条目）；底部「＋ 新建分组」|
 | 配置 AI | 顶栏「AI 设置」按钮（托盘模式也可从托盘菜单进入）|
+| 自动更新 | 启动时自动检查；有新版本弹窗确认后重启热替换；托盘菜单「检查更新…」可手动触发 |
 | 编辑条目 | 悬停卡片 → 「编辑」按钮（改文本内容 / 命名）|
 | 复制回剪贴板 | **点击卡片**（可直接粘贴到 QQ/微信）|
 | 置顶 / 取消 | 鼠标悬停卡片 → 右上角「置顶」按钮 |
@@ -184,6 +189,7 @@ python autostart.py remove     # 移除
 ## 🗄️ 数据说明
 
 - **数据库**：`clipboard_data/clipboard.db`，WAL 模式，采集线程写、界面读并发不阻塞
+- **数据目录位置**：打包版在 `%LOCALAPPDATA%\ClipVault\data`（exe 外面，重建/覆盖更新都不碰它，旧版 exe 旁的数据首次启动自动迁移）；源码版在 `<项目根>/clipboard_data`；`CLIPVAULT_DATA_DIR` 可强制指定
 - **AI 设置**：`clipboard_data/settings.json`（界面「AI 设置」保存的 API 配置，仅存本机，已被 gitignore）
 - **清理状态**：`clipboard_data/cleanup_state.json`（记录上次清理时间与删除条数；**不放 settings.json**——那个文件由 AI 设置窗整体覆写会被冲掉）
 - **图片**：`clipboard_data/images/` 下原图 + `thumb_` 前缀缩略图；数据库只存**相对数据目录**的路径（如 `images/thumb_xxx.png`），数据目录整体搬家后路径依然有效
@@ -218,7 +224,7 @@ clip_group_members(group_id, item_id, added_at, PRIMARY KEY(group_id, item_id))
 
 | 配置项 | 位置 / 变量 | 默认 |
 |---|---|---|
-| 数据目录 | `CLIPVAULT_DATA_DIR` | `<项目根>/clipboard_data` |
+| 数据目录 | `CLIPVAULT_DATA_DIR` | 打包版 `%LOCALAPPDATA%\ClipVault\data`；源码版 `<项目根>/clipboard_data` |
 | 未分组清理周期 | `CLIPVAULT_CLEANUP_DAYS` | 7 天（每周） |
 | 轮询间隔 | `watcher.py` → `POLL_INTERVAL` | 0.5 秒 |
 | 剪贴板重试 | `watcher.py` → `OPEN_RETRIES`/`OPEN_RETRY_DELAY` | 3 次 × 50ms |
@@ -234,13 +240,13 @@ python make_icon.py           # 生成 assets/icon.ico（已生成可跳过）
 pyinstaller packaging.spec
 ```
 
-产物在 `dist/ClipVault/ClipVault.exe`（onedir 模式：启动快、误报率低）。**拷贝时整个 `ClipVault` 文件夹一起拷**（旁边的 `_internal` 是运行时依赖）。双击即启动托盘 + 采集 + 窗口，无需安装 Python。排障时可把 `packaging.spec` 里 `console=False` 临时改 `True` 看日志。
+产物在 `dist/ClipVault/ClipVault.exe`（onedir 模式：启动快、误报率低）。**拷贝时整个 `ClipVault` 文件夹一起拷**（旁边的 `_internal` 是运行时依赖）。双击即启动托盘 + 采集 + 窗口，无需安装 Python。**数据不在这个文件夹里**（在 `%LOCALAPPDATA%\ClipVault\data`），重新打包/覆盖更新都不会丢数据。排障时可把 `packaging.spec` 里 `console=False` 临时改 `True` 看日志。
 
 ## 🧪 运行测试
 
 ```powershell
 pip install -e ".[dev]"
-pytest                        # 149 个用例，无需网络；GUI 用例需要桌面环境
+pytest                        # 172 个用例，无需网络；GUI 用例需要桌面环境
 ruff check .                  # 代码规范检查
 ```
 
@@ -268,7 +274,7 @@ ruff check .                  # 代码规范检查
 确认 pywin32、Pillow 已安装；部分程序（Office、远程桌面）会临时独占剪贴板，采集器会自动重试。
 
 **Q：换了机器/目录，历史记录还在吗？**
-`clipboard_data/` 整个拷过去即可；库里的图片路径是相对路径，数据目录放哪都有效。
+历史跟着**数据目录**走：打包版把 `%LOCALAPPDATA%\ClipVault\data` 整个拷到新机器同位置即可（库里的图片路径是相对路径，放哪都有效）；源码版拷 `<项目根>/clipboard_data`。程序本身随便搬，数据不受影响。
 
 ## 🗺️ Roadmap
 

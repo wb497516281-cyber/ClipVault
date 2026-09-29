@@ -10,15 +10,23 @@
 约定：
   - .env 只在对应环境变量尚未设置时生效，系统环境变量优先级更高；
   - 源码运行时 BASE_DIR = 项目根目录；PyInstaller 打包后（sys.frozen）
-    BASE_DIR = exe 所在目录，方便用户把 .env 放在 exe 旁边。
+    BASE_DIR = exe 所在目录，方便用户把 .env 放在 exe 旁边；
+  - 数据目录（数据库/图片/设置）：CLIPVAULT_DATA_DIR > 打包版
+    %LOCALAPPDATA%/ClipVault/data > 源码版 <项目根>/clipboard_data。
+    打包版数据必须放 exe 外面——躺在安装目录里，重建/覆盖更新会连数据
+    一起删（真实踩过坑，见 migrate_legacy_data_dir）。
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
+
+#: 应用版本号（与 pyproject.toml 的 version 保持一致，tests/test_config.py 有校验）
+APP_VERSION = "1.3.0"
 
 
 def _runtime_base_dir() -> Path:
@@ -90,9 +98,47 @@ def load_env_file(path: Path | None = None) -> None:
 
 
 def get_data_dir() -> Path:
-    """数据目录：CLIPVAULT_DATA_DIR 优先，默认 <基准目录>/clipboard_data。"""
+    """数据目录：CLIPVAULT_DATA_DIR 优先，默认按运行模式决定。
+
+    - 打包（frozen）模式：%LOCALAPPDATA%/ClipVault/data —— exe 外面，
+      重建/覆盖更新都不会碰它；没有 LOCALAPPDATA 时退回用户目录下；
+    - 源码模式：<项目根>/clipboard_data（开发便利，tests 用临时目录覆盖）。
+    """
     raw = os.environ.get("CLIPVAULT_DATA_DIR", "").strip()
-    return Path(raw).resolve() if raw else BASE_DIR / "clipboard_data"
+    if raw:
+        return Path(raw).resolve()
+    if getattr(sys, "frozen", False):
+        local = os.environ.get("LOCALAPPDATA", "").strip()
+        base = Path(local) if local else Path.home() / "AppData" / "Local"
+        return base / "ClipVault" / "data"
+    return BASE_DIR / "clipboard_data"
+
+
+def migrate_legacy_data_dir() -> None:
+    """打包版一次性迁移：exe 旁的旧 clipboard_data -> %LOCALAPPDATA%/ClipVault/data。
+
+    历史包袱：旧版本把数据放在 exe 旁边（dist/ClipVault/clipboard_data），
+    重新打包/覆盖安装会连数据一起删掉。新版默认 %LOCALAPPDATA%/ClipVault/data，
+    首次启动把旧目录整体搬过去（新目录已存在则不动，绝不覆盖用户现有数据）。
+
+    仅在满足以下全部条件时执行：打包模式、没有显式 CLIPVAULT_DATA_DIR、
+    旧目录存在、新目录不存在。任何异常只警告不阻断启动。
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    if os.environ.get("CLIPVAULT_DATA_DIR", "").strip():
+        return  # 用户显式指定了位置，不搬
+    legacy = BASE_DIR / "clipboard_data"
+    target = get_data_dir()
+    if not legacy.is_dir() or target.exists():
+        return
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(legacy), str(target))
+        print(f"[迁移] 旧数据目录已搬到 {target}", flush=True)
+    except OSError as exc:
+        # 跨盘/权限问题：不阻断启动，新位置会建空库，旧数据仍在原处
+        print(f"[警告] 数据目录迁移失败（{exc}），继续使用 {target}", flush=True)
 
 
 # ---------------------------------------------------------------------------

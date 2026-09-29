@@ -11,9 +11,10 @@
   7. 「分组」按钮弹出成员菜单：勾选加入/移出分组、现场新建分组、✨AI 建议本条去哪组；
   8. 分组栏「AI 自动分组」：后台把未分组条目分批交给分类模型归组（未配置 AI 自动降级）；
   9. 🧹 历史上限：未分组内容每周自动清理一次（分组内容永久保留），分组栏「清理未分组」可手动触发；
-  10. 置顶条目排最前且不同底色 + 左侧强调条；
-  11. 每 5 秒自动刷新（数据没变不重绘，不闪）；剪贴板采集在后台线程运行；
-  12. 语义检索走后台线程 + 查询向量缓存，接口慢不冻结界面。
+  10. 🔆 自动更新（打包版）：启动后台检查 GitHub Release，有新版本就下载，确认后重启热替换；
+  11. 置顶条目排最前且不同底色 + 左侧强调条；
+  12. 每 5 秒自动刷新（数据没变不重绘，不闪）；剪贴板采集在后台线程运行；
+  13. 语义检索走后台线程 + 查询向量缓存，接口慢不冻结界面。
 
 运行：python gui.py            （默认同时启动采集器）
       python gui.py --no-watch （只看界面，不采集）
@@ -26,6 +27,7 @@ from __future__ import annotations
 import sys
 import threading
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 try:
@@ -42,6 +44,7 @@ import cleanup
 import clipwriter
 import config
 import storage
+import updater
 from config import BASE_DIR
 
 # ---------------------------------------------------------------------------
@@ -2099,6 +2102,75 @@ class ClipVaultGUI:
         self._load_and_render()
         self.root.after(AUTO_REFRESH_MS, self._schedule_refresh)
 
+    # ------------------------------------------------------------------
+    # 自动更新：启动后台检查 GitHub Release -> 下载 -> 确认后热替换重启
+    # ------------------------------------------------------------------
+
+    def start_update_check(self, manual: bool = False) -> None:
+        """启动一次更新检查（守护线程，不阻塞界面）。
+
+        manual=True 来自用户手动触发（托盘「检查更新」）：没有新版本 /
+        检查失败都会给明确反馈；自动检查（启动时）只在新版本时才打扰用户。
+        """
+        if getattr(self, "_update_checking", False):
+            if manual:
+                self._toast("正在检查更新…")
+            return
+        self._update_checking = True
+        if manual:
+            self._toast("正在检查更新…")
+        updater.start_background_check(
+            lambda info: self.root.after(0, self._on_update_checked, info, manual)
+        )
+
+    def _on_update_checked(self, info: dict | None, manual: bool) -> None:
+        """检查完成（主线程）：无新版本仅手动时提示；有新版本则后台下载。"""
+        self._update_checking = False
+        if info is None:
+            if manual:
+                self._toast(f"✅ 已是最新版本 v{updater.current_version()}", error=not manual)
+            return
+        self._pending_update = info
+        self._toast(f"🔆 发现新版本 v{info['version']}，正在后台下载…")
+
+        def _run():
+            cached = updater._cached_zip(info["version"])
+            zip_path = cached or updater.download_update(info["zip_url"], info["version"])
+            self.root.after(0, self._on_update_downloaded, zip_path, info)
+
+        threading.Thread(target=_run, name="clipvault-update-download", daemon=True).start()
+
+    def _on_update_downloaded(self, zip_path, info: dict) -> None:
+        """下载完成（主线程）：确认后安装；用户选「以后再说」则下次启动再问。"""
+        if zip_path is None:
+            self._toast("⚠️ 更新包下载失败，下次启动再试", error=True)
+            return
+        body = (info.get("body") or "").strip()
+        if len(body) > 400:
+            body = body[:400] + "…"
+        confirmed = messagebox.askyesno(
+            "发现新版本",
+            f"ClipVault v{info['version']} 已下载完成。\n\n{body}\n\n"
+            "是否立即重启并更新？（更新只替换程序文件，不动你的数据）",
+            parent=self.root,
+        )
+        if not confirmed:
+            self._toast("已取消，更新包已缓存，下次启动再问")
+            return
+        if not updater.install_update(Path(zip_path)):
+            messagebox.showwarning(
+                "自动更新不可用",
+                f"当前环境不支持自动替换，请手动下载：\n{info.get('html_url') or updater.API_LATEST}",
+                parent=self.root,
+            )
+            return
+        self._toast("🚀 正在安装更新，应用即将重启…")
+        # 给 toast 一点渲染时间，再停采集、退窗口（安装脚本会等进程退出后动文件）
+        stop_event = getattr(self, "stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
+        self.root.after(600, self.root.destroy)
+
 
 # ---------------------------------------------------------------------------
 # 入口
@@ -2133,7 +2205,9 @@ def main(argv: list[str] | None = None) -> None:
         print("ClipVault 已启动（--no-watch：仅界面，不采集）。", flush=True)
 
     root = tk.Tk()
-    ClipVaultGUI(root)  # 实例由 root.after 回调与控件事件链路持有，无需外部引用
+    gui = ClipVaultGUI(root)  # 实例由 root.after 回调与控件事件链路持有，无需外部引用
+    gui.stop_event = stop_event  # 更新重启时要先停采集
+    gui.start_update_check()  # 后台检查 GitHub Release（源码模式自动跳过）
 
     def on_close():
         stop_event.set()

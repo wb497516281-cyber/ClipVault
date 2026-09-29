@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from config import get_data_dir, load_env_file
+from config import get_data_dir, load_env_file, migrate_legacy_data_dir
 
 # 导入时先加载 .env（保证 CLIPVAULT_DATA_DIR 等变量先生效）
 load_env_file()
@@ -130,7 +130,10 @@ def init_db() -> None:
     """初始化数据库：创建目录、建表、建索引，并开启 WAL 模式。
 
     WAL 模式让「采集线程写、界面读取」并发时互不阻塞，24 小时常开更稳。
+    先跑一次性迁移（打包版旧数据目录 -> %LOCALAPPDATA%/ClipVault/data），
+    再建目录——保证任何入口（GUI/托盘/纯采集）首启都会搬数据。
     """
+    migrate_legacy_data_dir()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     IMAGE_DIR.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(DB_PATH, timeout=5)) as conn:

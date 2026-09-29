@@ -732,3 +732,94 @@ def test_gui_auto_cleanup_hook_refreshes_on_delete(window, monkeypatch):
     window.update()
     assert gui._fingerprint != "sentinel"
     assert "每周清理" in gui.toast_var.get()
+
+
+# ---------------------------------------------------------------------------
+# 自动更新：检查 -> 下载 -> 确认 -> 热替换
+# ---------------------------------------------------------------------------
+
+
+def test_gui_update_check_full_flow(window, monkeypatch):
+    """手动检查更新：有新版本 -> 后台下载 -> 确认 -> 安装并安排退出。
+
+    全程无网络：check/download/install 都 monkeypatch；后台线程用同步
+    执行器替代（测试环境没有 mainloop，跨线程 root.after 会炸）。
+    """
+    from pathlib import Path
+
+    import gui as gui_module
+    import updater
+    from gui import ClipVaultGUI
+
+    _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+
+    info = {
+        "version": "9.9.9",
+        "name": "v9.9.9",
+        "body": "修复了一堆问题",
+        "zip_url": "https://example.com/ClipVault-v9.9.9-win64.zip",
+        "html_url": "https://example.com/release",
+    }
+    fake_zip = gui_module.config.get_data_dir() / "fake-update.zip"
+    monkeypatch.setattr(updater, "check_for_update", lambda: info)
+    monkeypatch.setattr(updater, "_cached_zip", lambda ver: None)
+    monkeypatch.setattr(updater, "download_update", lambda url, ver: fake_zip)
+    # 检查同步完成（updater 自己的线程也垫掉，测试环境无 mainloop）
+    monkeypatch.setattr(updater, "start_background_check", lambda on_result: on_result(info))
+    installed: list[Path] = []
+    monkeypatch.setattr(updater, "install_update", lambda p: installed.append(p) or True)
+    monkeypatch.setattr(gui_module.messagebox, "askyesno", lambda *a, **k: True)
+
+    # 同步线程垫片：下载线程（gui.py 内的 threading）就地跑完
+    class _SyncThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None, name=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    import threading as _real_threading
+
+    class _Shim:
+        Thread = _SyncThread
+        Event = _real_threading.Event
+
+    monkeypatch.setattr(gui_module, "threading", _Shim)
+
+    # 防真销毁共享测试窗口：把「退出」调度（600ms）记下来而不执行
+    real_after = window.after
+    exits: list = []
+
+    def _fake_after(ms, fn=None, *args):
+        if ms == 600:
+            exits.append(fn)
+            return "fake-id"
+        return real_after(ms, fn, *args)
+
+    monkeypatch.setattr(window, "after", _fake_after)
+
+    gui.start_update_check(manual=True)
+    window.update()  # 处理 root.after(0, _on_update_checked)
+    window.update()  # 处理 root.after(0, _on_update_downloaded)
+
+    assert installed == [fake_zip]  # 确认后进入安装
+    assert exits  # 安排了窗口退出（安装脚本随后接管）
+
+
+def test_gui_update_check_no_new_version_manual(window, monkeypatch):
+    """手动检查但没有新版本：toast 明示已是最新（自动检查则不打扰）。"""
+    import updater
+    from gui import ClipVaultGUI
+
+    _seed()
+    gui = ClipVaultGUI(window)
+    window.update()
+    monkeypatch.setattr(updater, "check_for_update", lambda: None)
+    # 检查同步完成：on_result(None) 就地调用（测试环境无 mainloop，跨线程 after 会炸）
+    monkeypatch.setattr(updater, "start_background_check", lambda on_result: on_result(None))
+
+    gui.start_update_check(manual=True)
+    window.update()
+    assert "已是最新版本" in gui.toast_var.get()

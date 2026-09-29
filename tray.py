@@ -108,6 +108,13 @@ class TrayApp:
         self.root.after(0, self._gui.start_auto_group)
         self.root.after(0, self.root.deiconify)
 
+    def check_update(self, icon=None, item=None) -> None:
+        """手动检查更新（GUI 内部按手动模式给反馈：最新/失败都有 toast）。"""
+        if self._gui is None:
+            return
+        self.root.after(0, self._gui.start_update_check, True)
+        self.root.after(0, self.root.deiconify)
+
     def toggle_pause(self, icon=None, item=None) -> None:
         if self.pause_event.is_set():
             self.pause_event.clear()
@@ -196,6 +203,7 @@ class TrayApp:
             pystray.MenuItem("打开界面", self.open_window, default=True),
             pystray.MenuItem("AI 设置…", self.open_settings),
             pystray.MenuItem("AI 自动分组…", self.auto_group_ai, enabled=self.ai_enabled),
+            pystray.MenuItem("检查更新…", self.check_update),
             pystray.MenuItem("暂停采集", self.toggle_pause, checked=self.is_paused),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("开机自启动", self.toggle_autostart, checked=self.autostart_enabled),
@@ -212,6 +220,7 @@ class TrayApp:
         self._gui = ClipVaultGUI(self.root)
         # GUI 设置变更后刷新托盘动态菜单（AI 状态/补建向量置灰）
         self._gui.notify_hook = self._refresh_tray_menu
+        self._gui.start_update_check()  # 托盘模式同样启动时检查更新
         tray_ok = self.start_tray()
         if not tray_ok:
             print('未安装 pystray，本次以纯窗口模式运行（pip install -e ".[tray]" 可启用托盘）。')
